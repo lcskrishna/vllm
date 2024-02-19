@@ -86,15 +86,15 @@ def main(args: argparse.Namespace):
                     print(f"Profiling (results will be saved to '{profile_dir}')...")
                     run_to_completion(profile_dir=args.profile_result_dir)
                     return
-                if args.rpd:
-                    from rpdTracerControl import rpdTracerControl
-                    rpdTracerControl.setFilename(name = "/workspace/trace.rpd", append=True)
-                    profile_rpd = rpdTracerControl()
-                    profile_rpd.start()
-                    print(f"RPD Profiling'...")
-                    run_to_completion(profile_dir=None)
-                    profile_rpd.stop()
-                    return
+                #if args.rpd:
+                #    from rpdTracerControl import rpdTracerControl
+                #    rpdTracerControl.setFilename(name = "/workspace/trace.rpd", append=True)
+                #    profile_rpd = rpdTracerControl()
+                #    profile_rpd.start()
+                #    print(f"RPD Profiling'...")
+                #    run_to_completion(profile_dir=None)
+                #    profile_rpd.stop()
+                #    return
 
                 # Benchmark.
                 latencies = []
