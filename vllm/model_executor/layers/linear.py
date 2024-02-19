@@ -66,12 +66,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         weight = weights["weight"]
-        #if self.separate_bias_add:
+        #if bias:
+        #    return F.linear(x, weight) + bias
+        #return F.linear(x, weight)
         if bias:
             return tgemm.mm(x, weight) + bias
         return tgemm.mm(x, weight)
         #return F.linear(x, weight, bias)
-
 
 class ReplicatedLinear(torch.nn.Module):
     """Replicated linear layer.
