@@ -78,6 +78,7 @@ class ModelConfig:
         max_model_len: Optional[int] = None,
         quantization: Optional[str] = None,
         enforce_eager: bool = False,
+        torch_compile_mode: bool = False,
         max_context_len_to_capture: Optional[int] = None,
     ) -> None:
         self.model = model
@@ -92,6 +93,7 @@ class ModelConfig:
         self.tokenizer_revision = tokenizer_revision
         self.quantization = quantization
         self.enforce_eager = enforce_eager
+        self.torch_compile_mode = torch_compile_mode
         self.max_context_len_to_capture = max_context_len_to_capture
 
         if os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true":

@@ -24,6 +24,7 @@ def main(args: argparse.Namespace):
         trust_remote_code=args.trust_remote_code,
         dtype=args.dtype,
         enforce_eager=args.enforce_eager,
+        torch_compile_mode=args.torch_compile_mode,
         kv_cache_dtype=args.kv_cache_dtype,
         device=args.device,
     )
@@ -122,6 +123,8 @@ if __name__ == '__main__':
     parser.add_argument('--enforce-eager',
                         action='store_true',
                         help='enforce eager mode and disable CUDA graph')
+    parser.add_argument('--torch-compile-mode', action='store_true',
+                        help='Run using torch.compile mode')
     parser.add_argument(
         "--kv-cache-dtype",
         type=str,

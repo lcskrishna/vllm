@@ -92,6 +92,7 @@ class LLMEngine:
             f"disable_custom_all_reduce={parallel_config.disable_custom_all_reduce}, "
             f"quantization={model_config.quantization}, "
             f"enforce_eager={model_config.enforce_eager}, "
+            f"torch_compile_mode={model_config.torch_compile_mode}, "
             f"kv_cache_dtype={cache_config.cache_dtype}, "
             f"device_config={device_config.device}, "
             f"seed={model_config.seed})")

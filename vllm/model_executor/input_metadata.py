@@ -27,6 +27,7 @@ class InputMetadata:
         block_tables: Optional[torch.Tensor],
         use_cuda_graph: bool,
         kv_cache_dtype: str,
+        use_torch_compile: bool,
     ) -> None:
         self.is_prompt = is_prompt
         self.prompt_lens = prompt_lens
@@ -38,6 +39,7 @@ class InputMetadata:
         self.block_tables = block_tables
         self.use_cuda_graph = use_cuda_graph
         self.kv_cache_dtype = kv_cache_dtype
+        self.use_torch_compile = use_torch_compile
 
         # Set during the execution of the first attention op.
         # FIXME(woosuk): This is a hack.
@@ -51,4 +53,5 @@ class InputMetadata:
                 f"context_lens={self.context_lens}, "
                 f"block_tables={self.block_tables}, "
                 f"use_cuda_graph={self.use_cuda_graph}, "
-                f"kv_cache_dtype={self.kv_cache_dtype})")
+                f"kv_cache_dtype={self.kv_cache_dtype},"
+                f"use_torch_compile={self.use_torch_compile})")

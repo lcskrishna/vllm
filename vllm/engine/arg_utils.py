@@ -36,6 +36,7 @@ class EngineArgs:
     tokenizer_revision: Optional[str] = None
     quantization: Optional[str] = None
     enforce_eager: bool = False
+    torch_compile_mode: bool = False
     max_context_len_to_capture: int = 8192
     disable_custom_all_reduce: bool = False
     enable_lora: bool = False
@@ -221,6 +222,9 @@ class EngineArgs:
                             help='Always use eager-mode PyTorch. If False, '
                             'will use eager mode and CUDA graph in hybrid '
                             'for maximal performance and flexibility.')
+        parser.add_argument('--torch-compile-mode',
+                            action='store_true',
+                            help='Run using torch.compile mode PyTorch.')
         parser.add_argument('--max-context-len-to-capture',
                             type=int,
                             default=EngineArgs.max_context_len_to_capture,
@@ -291,7 +295,7 @@ class EngineArgs:
             self.trust_remote_code, self.download_dir, self.load_format,
             self.dtype, self.seed, self.revision, self.code_revision,
             self.tokenizer_revision, self.max_model_len, self.quantization,
-            self.enforce_eager, self.max_context_len_to_capture)
+            self.enforce_eager, self.torch_compile_mode, self.max_context_len_to_capture)
         cache_config = CacheConfig(self.block_size,
                                    self.gpu_memory_utilization,
                                    self.swap_space, self.kv_cache_dtype,

@@ -250,6 +250,7 @@ class ModelRunner:
             block_tables=block_tables,
             use_cuda_graph=False,
             kv_cache_dtype=self.kv_cache_dtype,
+            use_torch_compile=self.model_config.torch_compile_mode,
         )
         return (input_tokens, input_positions, input_metadata, prompt_lens,
                 subquery_lens, lora_index_mapping, lora_prompt_mapping,
@@ -310,6 +311,7 @@ class ModelRunner:
         max_context_len = max(context_lens)
         use_captured_graph = (
             not self.model_config.enforce_eager
+            and not self.model_config.torch_compile_mode
             and batch_size <= _BATCH_SIZES_TO_CAPTURE[-1]
             and max_context_len <= self.max_context_len_to_capture)
         if use_captured_graph:
@@ -378,6 +380,7 @@ class ModelRunner:
             block_tables=block_tables,
             use_cuda_graph=use_captured_graph,
             kv_cache_dtype=self.kv_cache_dtype,
+            use_torch_compile=self.model_config.torch_compile_mode,
         )
         return (input_tokens, input_positions, input_metadata,
                 lora_index_mapping, lora_prompt_mapping, lora_requests)
@@ -516,6 +519,7 @@ class ModelRunner:
                 "block_tables": input_metadata.block_tables,
                 "use_cuda_graph": input_metadata.use_cuda_graph,
                 "kv_cache_dtype": input_metadata.kv_cache_dtype,
+                "use_torch_compile": input_metadata.use_torch_compile,
                 "selected_token_indices":
                 sampling_metadata.selected_token_indices,
                 "lora_requests": lora_requests,
@@ -539,6 +543,7 @@ class ModelRunner:
                 block_tables=metadata_dict["block_tables"],
                 use_cuda_graph=metadata_dict["use_cuda_graph"],
                 kv_cache_dtype=metadata_dict["kv_cache_dtype"],
+                use_torch_compile=metadata_dict["use_torch_compile"],
             )
             sampling_metadata = SamplingMetadata(
                 seq_groups=None,
@@ -570,6 +575,9 @@ class ModelRunner:
         if input_metadata.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
             model_executable = self.graph_runners[graph_batch_size]
+        elif input_metadata.use_torch_compile:
+            print ("-----> Running use_torch_compile mode : {}".format((self.compiled_model is not None)))
+            model_executable = self.model if self.compiled_model is None else self.compiled_model 
         else:
             model_executable = self.model
         hidden_states = model_executable(
@@ -705,8 +713,9 @@ class ModelRunner:
                 max_context_len=self.max_context_len_to_capture,
                 context_lens=context_lens[:batch_size],
                 block_tables=block_tables[:batch_size],
-                use_cuda_graph=True,
+                use_cuda_graph=False,
                 kv_cache_dtype=self.kv_cache_dtype,
+                use_torch_compile=True,
             )
 
             # Run the model with the dummy inputs.
@@ -777,6 +786,7 @@ class ModelRunner:
                     block_tables=block_tables[:batch_size],
                     use_cuda_graph=True,
                     kv_cache_dtype=self.kv_cache_dtype,
+                    use_torch_compile=False,
                 )
 
                 if self.lora_config:
@@ -786,9 +796,10 @@ class ModelRunner:
                     )
                     self.set_active_loras(set(), lora_mapping)
 
-                graph_runner = CUDAGraphRunner(
-                    self.model if self.compiled_model is None else self.
-                    compiled_model)
+                #graph_runner = CUDAGraphRunner(
+                #    self.model if self.compiled_model is None else self.
+                #    compiled_model)
+                graph_runner = CUDAGraphRunner(self.model)
                 graph_runner.capture(
                     input_tokens[:batch_size],
                     input_positions[:batch_size],
