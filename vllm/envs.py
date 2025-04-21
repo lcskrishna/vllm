@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_V1: bool = False
     VLLM_ROCM_USE_AITER: bool = False
+    VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_USE_AITER_2STAGE_MOE: bool = True
@@ -537,6 +538,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TORCH_PROFILER_DIR":
     lambda: (None if os.getenv("VLLM_TORCH_PROFILER_DIR", None) is None else os
              .path.expanduser(os.getenv("VLLM_TORCH_PROFILER_DIR", "."))),
+
+    # Whether to use aiter paged attention.
+    # By default is disabled.
+    "VLLM_ROCM_USE_AITER_PAGED_ATTN":
+     lambda: (os.getenv("VLLM_ROCM_USE_AITER_PAGED_ATTN", "False").lower() in
+             ("true", "1")),
 
     # Enables rpd profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.

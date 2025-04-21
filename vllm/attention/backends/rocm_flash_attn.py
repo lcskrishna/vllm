@@ -25,6 +25,27 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 _PARTITION_SIZE_ROCM = 256
 
+def is_rocm_aiter_paged_attn_enabled() -> bool:
+    return envs.VLLM_ROCM_USE_AITER_PAGED_ATTN \
+        and envs.VLLM_ROCM_USE_AITER \
+
+
+def _get_paged_attn_module() -> PagedAttention:
+    """
+    Initializes the appropriate PagedAttention module from `attention/ops`,
+    which is used as helper function
+    by `ROCmFlashAttentionImpl` and `ROCmFlashAttentionBackend`.
+    The choice of attention module depends on whether
+    AITER paged attention is enabled:
+    - If enabled, `ROCmFlashAttentionImpl` uses `AITERPagedAttention`.
+    - Otherwise, it defaults to using the original `PagedAttention`.
+    """
+    if is_rocm_aiter_paged_attn_enabled():
+        # Import AITERPagedAttention only when the flag is enabled
+        from vllm.attention.ops.rocm_aiter_paged_attn import (
+            AITERPagedAttention)
+        return AITERPagedAttention()
+    return PagedAttention()
 
 class ROCmFlashAttentionBackend(AttentionBackend):
 
@@ -55,7 +76,8 @@ class ROCmFlashAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
     ) -> Tuple[int, ...]:
-        return PagedAttention.get_kv_cache_shape(num_blocks, block_size,
+        paged_attn = _get_paged_attn_module()
+        return paged_attn.get_kv_cache_shape(num_blocks, block_size,
                                                  num_kv_heads, head_size)
 
     @staticmethod
@@ -64,14 +86,16 @@ class ROCmFlashAttentionBackend(AttentionBackend):
         dst_kv_cache: torch.Tensor,
         src_to_dst: torch.Tensor,
     ) -> None:
-        PagedAttention.swap_blocks(src_kv_cache, dst_kv_cache, src_to_dst)
+        paged_attn = _get_paged_attn_module()
+        paged_attn.swap_blocks(src_kv_cache, dst_kv_cache, src_to_dst)
 
     @staticmethod
     def copy_blocks(
         kv_caches: List[torch.Tensor],
         src_to_dists: torch.Tensor,
     ) -> None:
-        PagedAttention.copy_blocks(kv_caches, src_to_dists)
+        paged_attn = _get_paged_attn_module()
+        paged_attn.copy_blocks(kv_caches, src_to_dists)
 
 
 @dataclass
@@ -491,7 +515,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
-        supported_head_sizes = PagedAttention.get_supported_head_sizes()
+        self.paged_attn_module = _get_paged_attn_module()
+        supported_head_sizes = self.paged_attn_module.get_supported_head_sizes()
         if head_size not in supported_head_sizes:
             raise ValueError(
                 f"Head size {head_size} is not supported by PagedAttention. "
@@ -540,6 +565,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
                 self.attn_func = _sdpa_attention
                 logger.debug("Using naive (SDPA) attention in ROCmBackend")
+
+        self.aiter_kv_scales_initialized = False
 
     def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
         """torch.repeat_interleave(x, dim=1, repeats=n_rep)"""
@@ -618,12 +645,37 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         else:
             assert value is None
 
+        paged_attn = self.paged_attn_module
+
+        # Reshaping kv tensors is required for AITER paged attention kernel
+        # because it works on a different tensor shape,
+        # when the size of one element is one byte (int8/fp8 dtypes).
+        # This reshaping is only required on the first forward call
+        # and the kv cache must not be empty.
+        if (is_rocm_aiter_paged_attn_enabled() and kv_cache.dtype.itemsize == 1
+                and not self.aiter_kv_scales_initialized
+                and kv_cache.shape != torch.Size([0])):
+            num_blocks = kv_cache.shape[1]
+            block_size = kv_cache.shape[2] // (self.num_kv_heads *
+                                               self.head_size)
+            k_scale = torch.empty((self.num_kv_heads, num_blocks * block_size),
+                                  dtype=torch.float32,
+                                  device=kv_cache.device)
+            v_scale = torch.empty((self.num_kv_heads, num_blocks * block_size),
+                                  dtype=torch.float32,
+                                  device=kv_cache.device)
+            self.aiter_kv_scales_initialized = True
+            k_scale.fill_(layer._k_scale.item())
+            v_scale.fill_(layer._v_scale.item())
+            layer._k_scale = k_scale
+            layer._v_scale = v_scale
+
         # Only update KV cache for decoder self-attention
         # and encoder-decoder cross-attention
         if self.attn_type not in [
                 AttentionType.ENCODER, AttentionType.ENCODER_ONLY
         ] and kv_cache.numel() > 0:
-            key_cache, value_cache = PagedAttention.split_kv_cache(
+            key_cache, value_cache = paged_attn.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_size)
 
             if key is not None and value is not None:
@@ -631,7 +683,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 # cache. If kv_cache is not provided, the new key and value
                 # tensors are not cached. This happens during the initial
                 # memory profiling run.
-                PagedAttention.write_to_paged_cache(
+                paged_attn.write_to_paged_cache(
                     key,
                     value,
                     key_cache,
@@ -776,7 +828,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 # not applicable for encoder-only models
                 if self.attn_type != AttentionType.ENCODER_ONLY:
                     output[:
-                           num_prefill_tokens] = PagedAttention.forward_prefix(
+                           num_prefill_tokens] = paged_attn.forward_prefix(
                                query,
                                key,
                                value,
@@ -863,7 +915,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 if cpa_fp8_out:
                     return out.view(num_seqs, num_heads * head_size)
             else:
-                output[num_prefill_tokens:] = PagedAttention.forward_decode(
+                output[num_prefill_tokens:] = paged_attn.forward_decode(
                     decode_query,
                     key_cache,
                     value_cache,
