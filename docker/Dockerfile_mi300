@@ -1,0 +1,54 @@
+FROM rocm/pytorch-private:csrikris_rocm7.2_mi300_0202_vllm_rixl
+
+WORKDIR /app
+
+#RUN sed -i 's/http/https/g' /etc/apt/sources.list
+
+RUN apt-get update && \
+    apt-get install -y \
+    libibverbs-dev ibverbs-utils libtool libboost-all-dev \
+    libgrpc++-dev protobuf-compiler-grpc protobuf-compiler libprotobuf-dev \
+    libaio-dev liburing-dev pybind11-dev ninja-build libgflags-dev \
+    rdma-core infiniband-diags perftest openssh-server
+
+
+RUN pip install "pybind11[global]" meson==0.64.0 && \
+    pip install setuptools==75.1.0
+
+WORKDIR /app
+
+RUN git clone --recursive https://github.com/ROCm/rocSHMEM -b develop
+WORKDIR /app/rocSHMEM
+#RUN git clone --recursive https://github.com/ROCm/rocm-systems.git -b develop
+#WORKDIR /app/rocm-systems/projects/rocshmem
+
+ENV BUILD_DIR=/root
+RUN apt install -y autoconf libtool flex pkg-config
+#RUN apt-get remove --purge -y openmpi-bin libopenmpi-dev
+#RUN apt-get remove --purge mpich -y
+#RUN bash ./scripts/install_dependencies.sh
+#
+#ENV PATH=/root/install/ucx/bin/:$PATH
+#ENV LD_LIBRARY_PATH=/root/install/ucx/lib/:$LD_LIBRARY_PATH
+#ENV PATH=/root/install/ompi/bin/:$PATH
+#ENV LD_LIBRARY_PATH=/root/install/ompi/lib/:$LD_LIBRARY_PATH
+
+RUN mkdir -p /app/rocSHMEM/build
+WORKDIR /app/rocSHMEM/build
+#RUN mkdir -p /app/rocm-systems/projects/rocshmem/build
+#WORKDIR /app/rocm-systems/projects/rocshmem/build 
+
+RUN ../scripts/build_configs/all_backends -DUSE_IPC=ON -DUSE_EXTERNAL_MPI=OFF -DBUILD_LOCAL_GPU_TARGET_ONLY=ON
+
+
+WORKDIR /app
+RUN git clone --recursive https://github.com/ROCm/DeepEP.git
+WORKDIR /app/DeepEP
+RUN PYTORCH_ROCM_ARCH=gfx942 ROCSHMEM_DIR=/root/rocshmem/ python setup.py --variant rocm --disable-mpi build develop
+
+ENV OMPI_MCA_plm_rsh_args=-p2222
+ENV OMPI_ALLOW_RUN_AS_ROOT=1
+ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+ENV ROCSHMEM_TEST_UUID=1
+
+WORKDIR /app
