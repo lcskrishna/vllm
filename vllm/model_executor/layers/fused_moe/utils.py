@@ -244,6 +244,8 @@ def moe_kernel_quantize_input(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if quant_dtype == torch.float8_e4m3fn:
         return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
+    elif quant_dtype == torch.float8_e4m3fnuz:
+        return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == torch.int8:
         return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == "nvfp4":
