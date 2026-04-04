@@ -12,6 +12,12 @@ from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from vllm.utils.math_utils import round_up
+from vllm.platforms import current_platform
+if current_platform.is_rocm():
+    from vllm.utils.flydsl_grouped_gemm import (
+        flydsl_contiguous_mk_alignment,
+        is_flydsl_grouped_gemm_available,
+    )
 
 
 def expert_num_tokens_round_up_and_sum(
@@ -355,7 +361,13 @@ def deepgemm_moe_permute(
     H = aq.size(1)
     device = aq.device
 
-    block_m, block_k = get_mk_alignment_for_contiguous_layout()
+    if current_platform.is_rocm():
+        if is_flydsl_grouped_gemm_available():
+            block_m, block_k = flydsl_contiguous_mk_alignment()
+        else:
+            raise Exception("Please install aiter with FlyDSL support.")
+    else:
+        block_m, block_k = get_mk_alignment_for_contiguous_layout()
 
     M_sum = compute_aligned_M(
         M=topk_ids.size(0),
