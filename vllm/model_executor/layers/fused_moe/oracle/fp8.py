@@ -52,6 +52,7 @@ class Fp8MoeBackend(Enum):
     TRITON = "TRITON"
     BATCHED_TRITON = "BATCHED_TRITON"
     AITER = "AITER"
+    FLYDSL_GROUPED = "FLYDSL_GROUPED"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     BATCHED_VLLM_CUTLASS = "BATCHED_VLLM_CUTLASS"
     XPU = "XPU"
@@ -73,6 +74,7 @@ def _get_priority_backends(
         Fp8MoeBackend.FLASHINFER_TRTLLM,
         Fp8MoeBackend.FLASHINFER_CUTLASS,
         Fp8MoeBackend.DEEPGEMM,
+        Fp8MoeBackend.FYLDSL_GROUPED,
         Fp8MoeBackend.VLLM_CUTLASS,
         Fp8MoeBackend.TRITON,
         Fp8MoeBackend.MARLIN,
@@ -129,6 +131,13 @@ def backend_to_kernel_cls(
         )
 
         return [TritonOrDeepGemmExperts]
+
+    elif backend == Fp8MoeBackend.FLYDSL_GROUPED:
+        from vllm.model_executor.layers.fused_moe.flydsl_grouped_moe import (
+            TritonOrFlydslGroupedExperts,
+        )
+
+        return [TritonOrFlydslGroupedExperts]        
 
     elif backend == Fp8MoeBackend.BATCHED_DEEPGEMM:
         from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
@@ -200,6 +209,7 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
         "flashinfer_cutlass": Fp8MoeBackend.FLASHINFER_CUTLASS,
         "marlin": Fp8MoeBackend.MARLIN,
         "aiter": Fp8MoeBackend.AITER,
+        "flydsl_grouped": Fp8MoeBackend.FLYDSL_GROUPED,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -381,6 +391,15 @@ def select_fp8_moe_backend(
                 backend, config, weight_key, activation_key, activation_format
             )
 
+    if envs.is_set("VLLM_ROCM_USE_AITER_FLYDSL_GROUP_GEMM"):
+        if not envs.VLLM_ROCM_USE_AITER_FLYDSL_GROUP_GEMM:
+            AVAILABLE_BACKENDS.remove(Fp8MoeBackend.FLYDSL_GROUPED)
+        else:
+            backend = Fp8MoeBackend.FLYDSL_GROUPED
+            return _return_or_raise(
+                backend, config, weight_key, activation_key, activation_format
+            )
+
     if not allow_vllm_cutlass:
         AVAILABLE_BACKENDS.remove(Fp8MoeBackend.VLLM_CUTLASS)
         AVAILABLE_BACKENDS.remove(Fp8MoeBackend.BATCHED_VLLM_CUTLASS)
@@ -433,7 +452,7 @@ def convert_to_fp8_moe_kernel_format(
             w2_scale,
             tuple(layer.weight_block_size),
         )
-    elif fp8_backend == Fp8MoeBackend.AITER:
+    elif fp8_backend in [Fp8MoeBackend.AITER, Fp8MoeBackend.FLYDSL_GROUPED]:
         w13, w2 = rocm_aiter_ops.shuffle_weights(w13, w2)
     elif fp8_backend == Fp8MoeBackend.MARLIN:
         weight_block_size = getattr(layer, "weight_block_size", None)
