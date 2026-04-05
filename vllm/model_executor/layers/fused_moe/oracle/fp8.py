@@ -74,7 +74,7 @@ def _get_priority_backends(
         Fp8MoeBackend.FLASHINFER_TRTLLM,
         Fp8MoeBackend.FLASHINFER_CUTLASS,
         Fp8MoeBackend.DEEPGEMM,
-        Fp8MoeBackend.FYLDSL_GROUPED,
+        Fp8MoeBackend.FLYDSL_GROUPED,
         Fp8MoeBackend.VLLM_CUTLASS,
         Fp8MoeBackend.TRITON,
         Fp8MoeBackend.MARLIN,
