@@ -50,6 +50,13 @@ def flydsl_grouped_fp8_gemm_nt_contiguous(
     a_fp8, a_scale = a_pair
     b_fp8, b_scale = b_pair
     scale_a = a_scale.transpose(0, 1).contiguous()
+    # FlyDSL / ROCm kernels expect dense row-major device tensors; avoid
+    # non-contiguous views from workspace dtype reinterpretation.
+    a_fp8 = a_fp8.contiguous()
+    b_fp8 = b_fp8.contiguous()
+    b_scale = b_scale.contiguous()
+    expert_ids = expert_ids.contiguous()
+    out = out.contiguous()
     result = impl(
         a_fp8,
         b_fp8,

@@ -7,9 +7,12 @@ Same data flow as the standard FP8 contiguous MoE path (scatter -> grouped GEMM 
 act -> quant -> grouped GEMM -> gather), but grouped matmul uses
 ``flydsl_grouped_fp8_gemm_nt_contiguous`` (Aiter FlyDSL)
 
-EP scatter/gather helpers live in ``deep_gemm_utils`` (Triton); the name is
-historical and does not require the DeepGEMM library at runtime.
+Scatter/gather for this path uses ``flydsl_moe_scatter_gather`` (PyTorch) so we
+do not depend on Triton ``ep_scatter`` / ``_fwd_kernel_ep_scatter_2`` (problematic
+on some ROCm stacks). Grouped GEMM remains Aiter FlyDSL.
 """
+
+from math import prod
 
 import torch
 
@@ -21,10 +24,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
-from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
+from vllm.model_executor.layers.fused_moe.flydsl_moe_scatter_gather import (
     compute_aligned_M,
-    deepgemm_moe_permute,
-    deepgemm_unpermute_and_reduce,
+    flydsl_moe_permute,
+    flydsl_moe_unpermute_and_reduce,
 )
 from vllm.model_executor.layers.fused_moe.fallback import FallbackExperts
 from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
@@ -34,7 +37,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
-    per_token_group_quant_fp8_packed_for_deepgemm,
     silu_mul_per_token_group_quant_fp8_colmajor,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -42,7 +44,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
     kFp8Static128BlockSym,
 )
-from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
 from vllm.utils.flydsl_grouped_gemm import (
     flydsl_contiguous_mk_alignment,
     flydsl_grouped_fp8_gemm_nt_contiguous,
@@ -51,6 +52,19 @@ from vllm.utils.flydsl_grouped_gemm import (
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+def _larger_workspace_shape(
+    a: tuple[int, ...], b: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Return the tuple with greater or equal element count.
+
+    FlyDSL uses 2D (M_sum, dim) workspaces; Triton uses 3D (M, topk, dim) views
+    into the same logical scratch.  When ``_select_experts_impl`` falls back to
+    Triton (e.g. non-contiguous activations), buffers must still fit Triton's
+    layout; taking the max numel matches ``TritonOrDeepGemmExperts`` pessimism.
+    """
+    return a if prod(a) >= prod(b) else b
 
 
 def _valid_flydsl_grouped_gemm_shape(M: int, N: int, K: int) -> bool:
@@ -86,7 +100,7 @@ def _valid_flydsl_grouped_gemm(
         )
         return False
 
-    if w1.dtype != current_platform.fp8_dtype() or w2.dtype != torch.float8_e4m3fn:
+    if w1.dtype != current_platform.fp8_dtype() or w2.dtype != current_platform.fp8_dtype():
         logger.debug_once(
             "FlyDSL grouped GEMM disabled: invalid weight dtype(s). "
             "w1.dtype: %s, w2.dtype: %s",
@@ -184,32 +198,18 @@ class FlydslGroupedExperts(mk.FusedMoEExpertsModular):
     def _act_mul_quant(
         self, input: torch.Tensor, output: torch.Tensor, activation: MoEActivation
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """SiLU+mul+quant or act+quant using float32 block scales only (no UE8M0)."""
         assert self.block_shape is not None
         block_k = self.block_shape[1]
-        scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
 
         M_sum, N = input.size()
         activation_out_dim = self.adjust_N_for_activation(N, activation)
 
-        ## may not be needed.
-        if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
-            act_out = torch.empty(
-                (M_sum, activation_out_dim), dtype=input.dtype, device=input.device
-            )
-            self.activation(activation, act_out, input)
-            a2q, a2q_scale = per_token_group_quant_fp8_packed_for_deepgemm(
-                act_out,
-                block_k,
-                out_q=output,
-            )
-            return a2q, a2q_scale
-
         if activation == MoEActivation.SILU:
-            use_ue8m0 = scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
             return silu_mul_per_token_group_quant_fp8_colmajor(
                 input=input,
                 output=output,
-                use_ue8m0=use_ue8m0,
+                use_ue8m0=False,
             )
 
         act_out = torch.empty(
@@ -244,10 +244,6 @@ class FlydslGroupedExperts(mk.FusedMoEExpertsModular):
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
-        # ``deep_gemm`` _lazy_init may never run on ROCm; scale-format oracle still
-        # must be initialized for ``from_oracle()`` in _act_mul_quant.
-        DeepGemmQuantScaleFMT.init_oracle_cache()
-
         a1q = hidden_states
         _, N, K = w1.size()
 
@@ -256,6 +252,10 @@ class FlydslGroupedExperts(mk.FusedMoEExpertsModular):
             global_num_experts = local_num_experts
 
         assert w2.size(1) == K
+        # Same as TritonExperts: kernels assume B is column-major packed (stride 1 on K).
+        assert w1.stride(-1) == 1 and w2.stride(-1) == 1, (
+            "FlyDSL grouped GEMM expects expert weights with stride 1 on the last dim."
+        )
 
         M_sum = compute_aligned_M(
             M=topk_ids.size(0),
@@ -268,7 +268,7 @@ class FlydslGroupedExperts(mk.FusedMoEExpertsModular):
         a1q_perm = _resize_cache(
             workspace13.view(dtype=current_platform.fp8_dtype()), (M_sum, K)
         )
-        a1q, a1q_scale, expert_ids, inv_perm = deepgemm_moe_permute(
+        a1q, a1q_scale, expert_ids, inv_perm = flydsl_moe_permute(
             aq=a1q,
             aq_scale=a1q_scale,
             topk_ids=topk_ids,
@@ -278,6 +278,8 @@ class FlydslGroupedExperts(mk.FusedMoEExpertsModular):
             aq_out=a1q_perm,
         )
         assert a1q.size(0) == M_sum
+        a1q_scale = a1q_scale.contiguous()
+        expert_ids = expert_ids.contiguous()
 
         mm1_out = _resize_cache(workspace2, (M_sum, N))
         flydsl_grouped_fp8_gemm_nt_contiguous(
@@ -291,6 +293,7 @@ class FlydslGroupedExperts(mk.FusedMoEExpertsModular):
         a2q, a2q_scale = self._act_mul_quant(
             input=mm1_out.view(-1, N), output=quant_out, activation=activation
         )
+        a2q_scale = a2q_scale.contiguous()
 
         mm2_out = _resize_cache(workspace2, (M_sum, K))
         flydsl_grouped_fp8_gemm_nt_contiguous(
@@ -300,7 +303,7 @@ class FlydslGroupedExperts(mk.FusedMoEExpertsModular):
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
 
-        deepgemm_unpermute_and_reduce(
+        flydsl_moe_unpermute_and_reduce(
             a=mm2_out,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
@@ -337,20 +340,7 @@ class TritonOrFlydslGroupedExperts(FallbackExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        if is_flydsl_grouped_gemm_available() and _valid_flydsl_grouped_gemm_shape(
-            M, N, K
-        ):
-            return self.experts.workspace_shapes(
-                M,
-                N,
-                K,
-                topk,
-                global_num_experts,
-                local_num_experts,
-                expert_tokens_meta,
-                activation,
-            )
-        return self.fallback_experts.workspace_shapes(
+        triton_ws = self.fallback_experts.workspace_shapes(
             M,
             N,
             K,
@@ -360,6 +350,30 @@ class TritonOrFlydslGroupedExperts(FallbackExperts):
             expert_tokens_meta,
             activation,
         )
+        # Match runtime gating in ``_valid_flydsl_grouped_gemm`` (N > 512).
+        if (
+            is_flydsl_grouped_gemm_available()
+            and _valid_flydsl_grouped_gemm_shape(M, N, K)
+            and N > 512
+        ):
+            fly_ws = self.experts.workspace_shapes(
+                M,
+                N,
+                K,
+                topk,
+                global_num_experts,
+                local_num_experts,
+                expert_tokens_meta,
+                activation,
+            )
+            f13, f2, fout = fly_ws
+            t13, t2, tout = triton_ws
+            return (
+                _larger_workspace_shape(f13, t13),
+                _larger_workspace_shape(f2, t2),
+                _larger_workspace_shape(fout, tout),
+            )
+        return triton_ws
 
     def _select_experts_impl(
         self,
