@@ -113,7 +113,7 @@ class FlydslGroupedExperts(mk.FusedMoEExpertsModular):
 
     def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
-        assert quant_config.block_shape == tuple(flydsl_contiguous_mk_alignment())
+        assert quant_config.block_shape == flydsl_contiguous_mk_alignment()
         assert quant_config.quant_dtype == current_platform.fp8_dtype()
         assert not quant_config.per_act_token_quant
         assert not quant_config.per_out_ch_quant
