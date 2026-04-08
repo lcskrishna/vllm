@@ -56,7 +56,7 @@ def flydsl_grouped_fp8_gemm_nt_contiguous(
     b_fp8 = b_fp8.contiguous()
     b_scale = b_scale.contiguous()
     expert_ids = expert_ids.contiguous()
-    out = out.contiguous()
+    assert out.is_contiguous(), "out must be contiguous"
     result = impl(
         a_fp8,
         b_fp8,
