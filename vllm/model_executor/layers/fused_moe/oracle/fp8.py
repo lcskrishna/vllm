@@ -134,10 +134,10 @@ def backend_to_kernel_cls(
 
     elif backend == Fp8MoeBackend.FLYDSL_GROUPED:
         from vllm.model_executor.layers.fused_moe.flydsl_grouped_moe import (
-            TritonOrFlydslGroupedExperts,
+            FlydslGroupedExperts,
         )
 
-        return [TritonOrFlydslGroupedExperts]        
+        return [FlydslGroupedExperts]        
 
     elif backend == Fp8MoeBackend.BATCHED_DEEPGEMM:
         from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
@@ -395,10 +395,10 @@ def select_fp8_moe_backend(
         if not envs.VLLM_ROCM_USE_AITER_FLYDSL_GROUP_GEMM:
             AVAILABLE_BACKENDS.remove(Fp8MoeBackend.FLYDSL_GROUPED)
         else:
-            backend = Fp8MoeBackend.FLYDSL_GROUPED
-            return _return_or_raise(
-                backend, config, weight_key, activation_key, activation_format
-            )
+            if Fp8MoeBackend.FLYDSL_GROUPED in AVAILABLE_BACKENDS:
+                # Remove the backend so it can be added to the front 
+                AVAILABLE_BACKENDS.remove(Fp8MoeBackend.FLYDSL_GROUPED)
+            AVAILABLE_BACKENDS.insert(0, Fp8MoeBackend.FLYDSL_GROUPED)
 
     if not allow_vllm_cutlass:
         AVAILABLE_BACKENDS.remove(Fp8MoeBackend.VLLM_CUTLASS)
