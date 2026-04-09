@@ -105,6 +105,9 @@ if HAS_TRITON:
     from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
         GroupedTopk,
     )
+    from vllm.model_executor.layers.fused_moe.flydsl_grouped_moe import (
+        TritonOrFlydslGroupedExperts,
+    )
     from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
         TritonOrDeepGemmExperts,
     )
@@ -129,6 +132,7 @@ if HAS_TRITON:
         "DeepGemmExperts",
         "BatchedDeepGemmExperts",
         "TritonOrDeepGemmExperts",
+        "TritonOrFlydslGroupedExperts",
         "XPUExperts",
         "XPUExpertsFp8",
     ]
