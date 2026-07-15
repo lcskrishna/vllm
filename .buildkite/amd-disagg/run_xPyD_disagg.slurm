@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=vllm-disagg-pd
 #SBATCH --nodes=2
+#SBATCH --nodelist=ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-[1-4]
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
