@@ -378,6 +378,25 @@ fi
 
 echo "Final commands: $commands"
 
+# Buildkite dynamic pipeline upload: run on the login-node agent, not inside
+# Docker. ci-infra test-template-amd.j2 wraps commands with rocm-smi and
+# `cd /vllm-workspace/tests`; the buildkite-agent CLI lives on the host, not in
+# the container. Strip the wrapper and run the upload from the Buildkite
+# checkout (from `buildkite-agent pipeline upload` onward).
+if [[ "$commands" == *"pipeline upload"* ]]; then
+  echo "--- Buildkite pipeline upload (host execution, no container)"
+  checkout="${BUILDKITE_BUILD_CHECKOUT_PATH:-.}"
+  if [[ ! -d "${checkout}" ]]; then
+    echo "Error: BUILDKITE checkout not found: ${checkout}" >&2
+    exit 1
+  fi
+  upload_cmd="buildkite-agent pipeline upload${commands#*buildkite-agent pipeline upload}"
+  echo "Checkout: ${checkout}"
+  echo "Upload command: ${upload_cmd}"
+  bash -c "cd '${checkout}' && ${upload_cmd}"
+  exit $?
+fi
+
 # SLURM disagg P/D: run on the login-node agent (sbatch), not inside Docker.
 # ci-infra test-template-amd.j2 wraps commands with rocm-smi and
 # `cd /vllm-workspace/tests` (a container-only path). Strip the wrapper and run
