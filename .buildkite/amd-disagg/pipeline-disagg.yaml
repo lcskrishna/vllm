@@ -16,7 +16,7 @@ steps:
 
 - label: "DeepSeek-V3-PD-1P1D-TP8-MoRIIO-toy proxy"
   agents:
-    queue: amd_mi350_ainic 
+    queue: amd_mi350_ainic
   timeout_in_minutes: 480
   commands:
   - NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 RUN_AFTER_HEALTH=accuracy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh

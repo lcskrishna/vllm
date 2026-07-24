@@ -3748,7 +3748,7 @@ steps:
 # uploader runs on the SLURM login-node agent (no_plugin => command runs directly,
 # no run-amd-test.sh / Docker) and injects the native disagg pipeline.
 - label: "ROCm Disagg P/D (MoRIIO) — SLURM suite"
-  agent_pool: mi250_8
+  agent_pool: mi350_ainic
   no_plugin: true
   mirror_hardwares: [amddisagg]
   commands:
