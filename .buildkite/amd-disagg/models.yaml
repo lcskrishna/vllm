@@ -41,12 +41,11 @@ models:
       VLLM_USE_AITER_TRITON_SILU_MUL: "0"
     base_flags: "--trust-remote-code --kv-cache-dtype fp8"
     prefill:
-      tp: "--gpu-memory-utilization 0.85"
+      tp: "--max-model-len 65536 --gpu-memory-utilization 0.85 --enforce-eager"
       ep: "--gpu-memory-utilization 0.85 --enforce-eager"
     decode:
-      tp: "--gpu-memory-utilization 0.85"
-      ep: '--gpu-memory-utilization 0.75 --enforce-eager'
-        #ep: '--gpu-memory-utilization 0.75 --compilation-config {"cudagraph_mode":"PIECEWISE","custom_ops":["+quant_fp8"]}'
+      tp: "--max-model-len 65536 --gpu-memory-utilization 0.85 --enforce-eager"
+      ep: "--gpu-memory-utilization 0.75 --enforce-eager"
 
   - model: DeepSeek-V4-Pro
     env:
@@ -57,22 +56,29 @@ models:
       VLLM_ROCM_USE_AITER_PAGED_ATTN: "0"
       VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "0"
       VLLM_USE_AITER_TRITON_SILU_MUL: "0"
-    base_flags: "--trust-remote-code --kv-cache-dtype fp8 --distributed-executor-backend mp --max-num-seqs 512 --max-num-batched-tokens 8192 --max-model-len 32768 --compilation-config {\"mode\":3,\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}"
+    base_flags: "--trust-remote-code --kv-cache-dtype fp8"
     prefill:
-      tp: "--gpu-memory-utilization 0.9"
+      # 1P1D TP8: each node runs -tp 8 as an independent TP server
+      tp: "--max-model-len 65536 --gpu-memory-utilization 0.85 --enforce-eager"
+      # 1P1D Wide-EP8: DP+EP across 8 GPUs, prefill uses mori_high_throughput
+      ep: "--gpu-memory-utilization 0.85 --enforce-eager"
     decode:
-      tp: "--gpu-memory-utilization 0.9"
+      # 1P1D TP8
+      tp: "--max-model-len 65536 --gpu-memory-utilization 0.85 --enforce-eager"
+      # 1P1D Wide-EP8: decode uses mori_low_latency
+      ep: "--gpu-memory-utilization 0.75 --enforce-eager"
 
   - model: MiniMax-M3-MXFP8
     env:
       VLLM_ROCM_USE_AITER: "1"
-      VLLM_ROCM_USE_AITER_MOE: "1"
-      VLLM_ROCM_USE_AITER_RMSNORM: "1"
-    base_flags: "--trust-remote-code --attention-backend TRITON_ATTN --block-size 128"
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "0"
+    base_flags: "--trust-remote-code --kv-cache-dtype fp8 --attention-backend TRITON_ATTN --block-size 128 --moe-backend aiter --language-model-only"
     prefill:
-      tp: "--gpu-memory-utilization 0.85"
+      tp: "--gpu-memory-utilization 0.85 --enforce-eager"
+      ep: "--gpu-memory-utilization 0.85 --enforce-eager"
     decode:
-      tp: "--gpu-memory-utilization 0.85"
+      tp: "--gpu-memory-utilization 0.85 --enforce-eager"
+      ep: "--gpu-memory-utilization 0.75 --enforce-eager"
 
   - model: DeepSeek-R1-MXFP4
     env:
@@ -80,11 +86,16 @@ models:
       VLLM_ROCM_USE_AITER_MLA: "1"
       VLLM_ROCM_USE_AITER_MOE: "1"
       VLLM_ROCM_USE_AITER_RMSNORM: "1"
+      VLLM_ROCM_USE_AITER_PAGED_ATTN: "0"
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "0"
+      VLLM_USE_AITER_TRITON_SILU_MUL: "0"
     base_flags: "--trust-remote-code --kv-cache-dtype fp8"
     prefill:
-      tp: "--gpu-memory-utilization 0.85"
+      tp: "--gpu-memory-utilization 0.85 --enforce-eager"
+      ep: "--gpu-memory-utilization 0.85 --enforce-eager"
     decode:
-      tp: "--gpu-memory-utilization 0.85"
+      tp: "--gpu-memory-utilization 0.85 --enforce-eager"
+      ep: "--gpu-memory-utilization 0.75 --enforce-eager"
 
   - model: Kimi-K2.5-MXFP4
     env:
@@ -102,11 +113,17 @@ models:
       VLLM_ROCM_USE_AITER: "1"
       AMDGCN_USE_BUFFER_OPS: "1"
       VLLM_ROCM_USE_AITER_MLA: "1"
+      VLLM_ROCM_USE_AITER_MOE: "1"
+      VLLM_ROCM_USE_AITER_RMSNORM: "1"
+      VLLM_ROCM_USE_AITER_PAGED_ATTN: "0"
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "0"
+      VLLM_USE_AITER_TRITON_SILU_MUL: "0"
       VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: "INT4"
       VLLM_ROCM_USE_SKINNY_GEMM: "0"
-      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "1"
-    base_flags: "--trust-remote-code --kv-cache-dtype fp8 --mm-encoder-tp-mode data --block-size 1 --attention-backend ROCM_AITER_MLA"
+    base_flags: "--trust-remote-code --kv-cache-dtype fp8 --block-size 1 --attention-backend ROCM_AITER_MLA"
     prefill:
-      tp: "--gpu-memory-utilization 0.9"
+      tp: "--gpu-memory-utilization 0.9 --enforce-eager"
+      ep: "--gpu-memory-utilization 0.9 --enforce-eager"
     decode:
-      tp: "--gpu-memory-utilization 0.9"
+      tp: "--gpu-memory-utilization 0.9 --enforce-eager"
+      ep: "--gpu-memory-utilization 0.9 --enforce-eager"

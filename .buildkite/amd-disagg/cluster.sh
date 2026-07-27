@@ -49,8 +49,8 @@ export TP_SIZE="${TP_SIZE:-${GPUS_PER_NODE}}"
 
 # ----------------------------------------------------------------- ports
 # TP-mode (WIDE_EP_MODE=0) server ports.
-export PREFILL_PORT="${PREFILL_PORT:-8100}"
-export DECODE_PORT="${DECODE_PORT:-8200}"
+export PREFILL_PORT="${PREFILL_PORT:-20005}"
+export DECODE_PORT="${DECODE_PORT:-40005}"
 
 # EP-mode (WIDE_EP_MODE=1) ports: API serve port, DP RPC port, KV transfer port, and
 # per-node MoRIIO local ping port (must differ from PROXY_PING_PORT).
@@ -87,7 +87,7 @@ export MORIIO_READ_MODE="${MORIIO_READ_MODE:-0}"
 export ROUTER_TYPE="${ROUTER_TYPE:-vllm-router}"
 export ROUTER_PORT="${ROUTER_PORT:-30000}"
 export ROUTER_POLICY="${ROUTER_POLICY:-round_robin}"
-export VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE:-vllm/vllm-router:nightly}"
+export VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE:-itej89/open-source:vllm-router_feat_enable_remote_tp_size_be5aa9c}"
 # Single client-facing port bench/accuracy target: the router port when routing,
 # else the toy proxy port. Env override always wins.
 if [[ "${ROUTER_TYPE}" == "vllm-router" ]]; then
@@ -106,6 +106,7 @@ export LOG_PATH="${LOG_PATH:-${_LOG_BASE}/${SLURM_JOB_ID:-local}}"
 # AITER kernel toggles live in models.yaml under each model's `env:` block.
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 export HSA_NO_SCRATCH_RECLAIM="${HSA_NO_SCRATCH_RECLAIM:-1}"
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-36000}"
 
 #export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 #export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
@@ -115,7 +116,7 @@ export HF_HOME="${HF_HOME:-/tmp/hf_home}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/.cache}"
 # MoRIIO read-mode: decode pulls KV from prefill (matches the toy proxy READ path").
 export VLLM_MORIIO_CONNECTOR_READ_MODE="${VLLM_MORIIO_CONNECTOR_READ_MODE:-1}"
-export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
+export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-36000}"
 
 # ----------------------------------------------------------------- patch / scale
 # MoRIIO multi-node DP patch (vLLM PR #39276). auto = apply only when WIDE_EP_MODE=1
