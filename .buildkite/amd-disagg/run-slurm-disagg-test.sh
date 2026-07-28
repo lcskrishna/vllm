@@ -14,7 +14,7 @@
 # fans out one container per node via a single srun, and hands off to
 # vllm_disagg.sh (rank-based prefill/decode self-select).
 #
-# Default target: 1P1D TP8 (NODES=2), pinned image v0.23.0, accuracy gate.
+# Default target: 1P1D TP8 (NODES=2), nightly image, accuracy gate.
 #
 # Spur usage (fire-and-forget; the default here):
 #   bash run-slurm-disagg-test.sh                       # 1P1D TP8
@@ -33,7 +33,7 @@ JOB_SCRIPT="${JOB_SCRIPT:-${SCRIPT_DIR}/run_xPyD_disagg.slurm}"
 
 # ---- knobs (override from the Buildkite step env) --------------------------
 # Defaults tuned for the Spur AMD MI350X cluster
-IMAGE="${IMAGE:-vllm/vllm-openai-rocm:v0.23.0}"
+IMAGE="${IMAGE:-vllm/vllm-openai-rocm:nightly}"
 NODES="${NODES:-2}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 PARTITION="${SLURM_PARTITION:-}"
