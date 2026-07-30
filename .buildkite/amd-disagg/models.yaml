@@ -45,8 +45,8 @@ models:
       ep: "--gpu-memory-utilization 0.85 --enforce-eager"
     decode:
       tp: "--gpu-memory-utilization 0.85"
-      ep: '--gpu-memory-utilization 0.75 --enforce-eager'
-        #ep: '--gpu-memory-utilization 0.75 --compilation-config {"cudagraph_mode":"PIECEWISE","custom_ops":["+quant_fp8"]}'
+      #ep: '--gpu-memory-utilization 0.75 --enforce-eager'
+      ep: '--gpu-memory-utilization 0.75 --compilation-config {"cudagraph_mode":"PIECEWISE","custom_ops":["+quant_fp8"]}'
 
   - model: DeepSeek-V4-Pro
     env:

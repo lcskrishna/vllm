@@ -1,9 +1,4 @@
-# Native Buildkite pipeline — disaggregated P/D SLURM tests (MoRIIO).
-#
-# Step order is deliberate: every 1P1D (2-node) case runs before any 2P2D
-# (4-node) case, so the cheaper topology validates the fabric before the suite
-# starts asking the scheduler for 4-node allocations. Within each topology,
-# models are grouped, and each model runs `proxy` then `vllm-router`.
+# Native Buildkite pipeline — disaggregated PD SLURM tests (MoRIIO).
 #
 # ROUTER_TYPE must be set explicitly on every step: run-slurm-disagg-test.sh
 # defaults to `vllm-router`

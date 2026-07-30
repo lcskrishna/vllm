@@ -230,17 +230,6 @@ echo "[disagg-pd] IPADDRS=${IPADDRS}"
 echo "[disagg-pd] launching ${NUM_NODES} containers (1/node) -> vllm_disagg.sh node"
 
 # Per-node container launch, auto-dispatched by srun availability:
-#   * classic Slurm: the batch body runs ONCE; srun fans out one task/node and
-#     supplies the global rank via $SLURM_PROCID. The launcher fn is shipped to
-#     each remote shell via `declare -f`. --label prefixes each line with the
-#     task id so interleaved orchestration logs stay readable in CI.
-#   * Spur: there is no srun in the job body, and the body ALREADY runs once per
-#     node; this node's global rank is $SPUR_TASK_OFFSET, so the launcher is
-#     invoked directly (no fan-out).
-# rank->role (rank 0 = prefill master + MoRIIO proxy + orchestrator; 1..xP-1 =
-# prefill; xP..end = decode) is resolved inside vllm_disagg.sh. rank 0's exit
-# code (the workload pass/fail) propagates out as this job's exit code.
-
 # Launch this node's disagg container and hand off to vllm_disagg.sh. $1 = this
 # node's global rank. Relies on the env exported above (forwarded by srun on
 # classic Slurm; already in scope when called directly on Spur).
@@ -253,6 +242,7 @@ run_node_container() {
     local stale
     stale=$(docker ps -aq --filter name=vllm_disagg_ 2>/dev/null) || true
     [ -n "$stale" ] && { echo "Reaping stale containers on $(hostname): $stale"; docker rm -f $stale 2>/dev/null || true; }
+
     # Bind-mount the host AMD Pensando (ionic) RoCE userspace provider into the
     # container IF present: the image ships an ABI-incompatible copy and the NICs
     # are invisible without the host libs. Each entry is added only when the host
@@ -278,10 +268,6 @@ run_node_container() {
     fi
 
     # Start the external vLLM router as a SEPARATE container on the rank-0 node.
-    # It shares the host network with the main container (both --network host):
-    # prefill/decode register to :$PROXY_PING_PORT (discovery) and clients hit
-    # :$ROUTER_PORT. Only started when ROUTER_TYPE=vllm-router. Rank-based ($rank)
-    # so it works under both classic Slurm and Spur direct dispatch.
     if [ "$ROUTER_TYPE" = "vllm-router" ] && [ "$rank" = "0" ] && [ "$DRY_RUN" = "1" ]; then
         echo "DRY_RUN: would start vllm-router on $(hostname): $VLLM_ROUTER_IMAGE (discovery :$PROXY_PING_PORT, port :$ROUTER_PORT, policy $ROUTER_POLICY, dp_local=$ROUTER_DP_LOCAL)"
     elif [ "$ROUTER_TYPE" = "vllm-router" ] && [ "$rank" = "0" ]; then
@@ -360,7 +346,7 @@ run_node_container() {
     local node_rc=${PIPESTATUS[0]}   # docker run exit code (not tee), for rank-0 pass/fail
     # Stop the external router (rank-0 node) once the main container returns.
     if [ "$ROUTER_TYPE" = "vllm-router" ] && [ "$rank" = "0" ]; then
-        docker rm -f "$ROUTER_CONT_NAME" 2>/dev/null || true
+        docker stop "$ROUTER_CONT_NAME" 2>/dev/null || true; docker rm "$ROUTER_CONT_NAME" 2>/dev/null || true; 
     fi
     return "$node_rc"
 }
