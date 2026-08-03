@@ -68,7 +68,17 @@ export PROXY_PING_PORT="${PROXY_PING_PORT:-36367}"
 export HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
 export NOTIFY_PORT="${NOTIFY_PORT:-61005}"
 
-export PROXY_SCRIPT="${PROXY_SCRIPT:-/app/vllm/examples/disaggregated/disaggregated_serving/moriio_toy_proxy_server.py}"
+# examples/ sits at a different path per image: the release/nightly image ships
+# it under /app/vllm, the per-commit CI image (rocm/vllm-ci) under
+# /vllm-workspace. Probed here so either image works; sourced inside the
+# container, so these paths are the container's.
+_proxy_rel="examples/disaggregated/disaggregated_serving/moriio_toy_proxy_server.py"
+if [[ -z "${PROXY_SCRIPT:-}" ]]; then
+    for _d in /app/vllm /vllm-workspace; do
+        if [[ -f "${_d}/${_proxy_rel}" ]]; then PROXY_SCRIPT="${_d}/${_proxy_rel}"; break; fi
+    done
+fi
+export PROXY_SCRIPT="${PROXY_SCRIPT:-/app/vllm/${_proxy_rel}}"
 
 # MoRIIO KV transfer direction (injected into --kv-transfer-config by the launcher):
 #   0 -> omit read_mode     (default; MoRIIO write mode: prefill pushes to decode)

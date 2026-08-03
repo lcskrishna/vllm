@@ -2,158 +2,246 @@
 #
 # ROUTER_TYPE must be set explicitly on every step: run-slurm-disagg-test.sh
 # defaults to `vllm-router`
+#
+# Image resolution: steps run the per-commit CI build (rocm/vllm-ci:<commit>) so
+# the PR's own code is what gets tested. `$$` defers expansion to the agent shell
+# (Buildkite interpolates single-$ at upload time), so passing IMAGE on the build
+# still wins. There is deliberately no nightly fallback — verify-ci-image below
+# fails the run when the commit has no image, rather than silently testing a
+# different build.
+#
+# Two build-time knobs, both interpolated at upload:
+#   ROCM_BUILDER_QUEUE  agent queue running the container build; amd_cpu is the
+#                       builder pool. The SLURM login-node queue cannot build
+#                       (no disk headroom), so this must stay a builder queue.
+#   CI_IMAGE_REPO       registry namespace to push to. Pushing to rocm/ requires
+#                       credentials for that org; point this at a namespace you
+#                       own otherwise.
+#
+# TEMPORARY: only one test step is active while the CI-image switch is validated.
+# Re-enable the rest by uncommenting.
 
 steps:
 
+- label: ":docker: build ROCm CI image for this commit"
+  key: build-ci-image
+  agents:
+    queue: "${ROCM_BUILDER_QUEUE:-amd_cpu}"
+  timeout_in_minutes: 300
+  commands:
+  - bash .buildkite/scripts/rocm/build-ci-base.sh
+  - bash .buildkite/scripts/rocm/build-test-image.sh
+  - bash .buildkite/scripts/rocm/smoke-test-image.sh
+  env:
+    DOCKER_BUILDKIT: "1"
+    BUILDKIT_PROGRESS: "plain"
+    VLLM_BAKE_FILE: "docker/docker-bake-rocm.hcl"
+    # Kept identical to hardware_tests/amd.yaml so the content-addressed ci_base
+    # layer is reused rather than rebuilt from scratch.
+    PYTORCH_ROCM_ARCH: "gfx90a;gfx942;gfx950"
+    IMAGE_TAG: "${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT"
+    # 0 = build from this agent's checkout. Unlike REMOTE_VLLM=1 (which clones
+    # VLLM_REPO at VLLM_BRANCH) this works for commits that only exist on a fork
+    # or have not been pushed.
+    REMOTE_VLLM: "0"
+  retry:
+    automatic:
+      - exit_status: -1   # agent lost
+        limit: 1
+      - exit_status: -10  # agent lost
+        limit: 1
+
+- label: ":mag: verify CI image for this commit"
+  key: verify-ci-image
+  depends_on: build-ci-image
+  agents:
+    queue: amd_mi350_ainic
+  timeout_in_minutes: 10
+  commands:
+  - |
+    IMG="$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT}"
+    echo "disagg suite image: $$IMG"
+    REPO="$${IMG%:*}"
+    TAG="$${IMG##*:}"
+    CODE="$$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' "https://hub.docker.com/v2/repositories/$${REPO}/tags/$${TAG}")"
+    if [ "$$CODE" != "200" ]; then
+      echo "FATAL: $$IMG is not present in the registry (HTTP $$CODE)."
+      echo "No AMD CI image was built for this commit."
+      echo "Run the AMD build pipeline for this commit first, or set IMAGE=<explicit image> on this build."
+      exit 1
+    fi
+    echo "OK: $$IMG present"
+
 #--------------------------------------  mi350 · disagg 1P1D (TP8, 2 nodes) · SLURM  --------------------------------------#
 
-- label: "DeepSeek-V3-PD-1P1D-TP8-MoRIIO-proxy"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=DeepSeek-V3 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "DeepSeek-V3-PD-1P1D-TP8-MoRIIO-vllm-router"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=DeepSeek-V3 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "DeepSeek-R1-MXFP4-PD-1P1D-TP8-MoRIIO-proxy"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=DeepSeek-R1-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "DeepSeek-R1-MXFP4-PD-1P1D-TP8-MoRIIO-vllm-router"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=DeepSeek-R1-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "Kimi-K2.5-MXFP4-PD-1P1D-TP8-MoRIIO-proxy"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=Kimi-K2.5-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "Kimi-K2.5-MXFP4-PD-1P1D-TP8-MoRIIO-vllm-router"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=Kimi-K2.5-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "Kimi-K2.6-MXFP4-PD-1P1D-TP8-MoRIIO-proxy"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=Kimi-K2.6-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "Kimi-K2.6-MXFP4-PD-1P1D-TP8-MoRIIO-vllm-router"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=Kimi-K2.6-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "MiniMax-M3-MXFP8-PD-1P1D-TP8-MoRIIO-proxy"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=MiniMax-M3-MXFP8 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "MiniMax-M3-MXFP8-PD-1P1D-TP8-MoRIIO-vllm-router"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=MiniMax-M3-MXFP8 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-#--------------------------------------  mi350 · disagg 2P2D (TP8, 4 nodes) · SLURM  --------------------------------------#
-
-- label: "DeepSeek-V3-PD-2P2D-TP8-MoRIIO-proxy"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=DeepSeek-V3 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "DeepSeek-V3-PD-2P2D-TP8-MoRIIO-vllm-router"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=DeepSeek-V3 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "DeepSeek-R1-MXFP4-PD-2P2D-TP8-MoRIIO-proxy"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=DeepSeek-R1-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "DeepSeek-R1-MXFP4-PD-2P2D-TP8-MoRIIO-vllm-router"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=DeepSeek-R1-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "Kimi-K2.5-MXFP4-PD-2P2D-TP8-MoRIIO-proxy"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=Kimi-K2.5-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "Kimi-K2.5-MXFP4-PD-2P2D-TP8-MoRIIO-vllm-router"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=Kimi-K2.5-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "Kimi-K2.6-MXFP4-PD-2P2D-TP8-MoRIIO-proxy"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=Kimi-K2.6-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "Kimi-K2.6-MXFP4-PD-2P2D-TP8-MoRIIO-vllm-router"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=Kimi-K2.6-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "MiniMax-M3-MXFP8-PD-2P2D-TP8-MoRIIO-proxy"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=MiniMax-M3-MXFP8 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-- label: "MiniMax-M3-MXFP8-PD-2P2D-TP8-MoRIIO-vllm-router"
-  agents:
-    queue: amd_mi350_ainic
-  timeout_in_minutes: 480
-  commands:
-  - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=MiniMax-M3-MXFP8 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
-
-#--------------------------------------  mi350 · disagg wide-EP (disabled)  --------------------------------------#
-
-# - label: "DeepSeek-V3-PD-1P1D-EP8/DP8-WideEP-MoRIIO-proxy"
+# - label: "DeepSeek-V3-PD-1P1D-TP8-MoRIIO-proxy"
+#   depends_on: verify-ci-image
 #   agents:
 #     queue: amd_mi350_ainic
 #   timeout_in_minutes: 480
 #   commands:
-#   - IMAGE=vllm/vllm-openai-rocm:nightly MODEL_NAME=DeepSeek-V3 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=1 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=DeepSeek-V3 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+- label: "DeepSeek-V3-PD-1P1D-TP8-MoRIIO-vllm-router"
+  depends_on: verify-ci-image
+  agents:
+    queue: amd_mi350_ainic
+  timeout_in_minutes: 480
+  commands:
+  - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=DeepSeek-V3 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "DeepSeek-R1-MXFP4-PD-1P1D-TP8-MoRIIO-proxy"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=DeepSeek-R1-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "DeepSeek-R1-MXFP4-PD-1P1D-TP8-MoRIIO-vllm-router"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=DeepSeek-R1-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "Kimi-K2.5-MXFP4-PD-1P1D-TP8-MoRIIO-proxy"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=Kimi-K2.5-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "Kimi-K2.5-MXFP4-PD-1P1D-TP8-MoRIIO-vllm-router"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=Kimi-K2.5-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "Kimi-K2.6-MXFP4-PD-1P1D-TP8-MoRIIO-proxy"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=Kimi-K2.6-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "Kimi-K2.6-MXFP4-PD-1P1D-TP8-MoRIIO-vllm-router"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=Kimi-K2.6-MXFP4 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "MiniMax-M3-MXFP8-PD-1P1D-TP8-MoRIIO-proxy"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=MiniMax-M3-MXFP8 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "MiniMax-M3-MXFP8-PD-1P1D-TP8-MoRIIO-vllm-router"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=MiniMax-M3-MXFP8 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+#--------------------------------------  mi350 · disagg 2P2D (TP8, 4 nodes) · SLURM  --------------------------------------#
+
+# - label: "DeepSeek-V3-PD-2P2D-TP8-MoRIIO-proxy"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=DeepSeek-V3 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "DeepSeek-V3-PD-2P2D-TP8-MoRIIO-vllm-router"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=DeepSeek-V3 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "DeepSeek-R1-MXFP4-PD-2P2D-TP8-MoRIIO-proxy"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=DeepSeek-R1-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "DeepSeek-R1-MXFP4-PD-2P2D-TP8-MoRIIO-vllm-router"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=DeepSeek-R1-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "Kimi-K2.5-MXFP4-PD-2P2D-TP8-MoRIIO-proxy"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=Kimi-K2.5-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "Kimi-K2.5-MXFP4-PD-2P2D-TP8-MoRIIO-vllm-router"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=Kimi-K2.5-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "Kimi-K2.6-MXFP4-PD-2P2D-TP8-MoRIIO-proxy"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=Kimi-K2.6-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "Kimi-K2.6-MXFP4-PD-2P2D-TP8-MoRIIO-vllm-router"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=Kimi-K2.6-MXFP4 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "MiniMax-M3-MXFP8-PD-2P2D-TP8-MoRIIO-proxy"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=MiniMax-M3-MXFP8 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+# - label: "MiniMax-M3-MXFP8-PD-2P2D-TP8-MoRIIO-vllm-router"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=MiniMax-M3-MXFP8 xP=2 yD=2 NODES=4 GPUS_PER_NODE=8 WIDE_EP_MODE=0 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=vllm-router WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh
+
+#--------------------------------------  mi350 · disagg wide-EP (disabled)  --------------------------------------#
+
+# - label: "DeepSeek-V3-PD-1P1D-EP8/DP8-WideEP-MoRIIO-proxy"
+#   depends_on: verify-ci-image
+#   agents:
+#     queue: amd_mi350_ainic
+#   timeout_in_minutes: 480
+#   commands:
+#   - IMAGE=$${IMAGE:-${CI_IMAGE_REPO:-rocm/vllm-ci}:$BUILDKITE_COMMIT} MODEL_NAME=DeepSeek-V3 NODES=2 GPUS_PER_NODE=8 WIDE_EP_MODE=1 MORIIO_READ_MODE=0 RUN_AFTER_HEALTH=accuracy ROUTER_TYPE=proxy WAIT=1 SLURM_TIME_LIMIT=08:30:00 bash .buildkite/amd-disagg/run-slurm-disagg-test.sh

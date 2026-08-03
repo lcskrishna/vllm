@@ -260,7 +260,10 @@ run_node_container() {
     # Pull latest container.
     if [ "$DRY_RUN" != "1" ]; then
         echo "Rank $rank pulling image on $(hostname): $IMAGE"
-        docker pull "$IMAGE" || echo "WARN: docker pull failed on $(hostname) for $IMAGE (using local copy if present)"
+        # Fatal, not a warning: IMAGE is a per-commit tag, so falling back to a
+        # cached local copy would silently test a different commit and can still
+        # report PASS.
+        docker pull "$IMAGE" || { echo "FATAL: docker pull failed on $(hostname) for $IMAGE"; return 1; }
         if [ "$ROUTER_TYPE" = "vllm-router" ] && [ "$rank" = "0" ]; then
             echo "Rank $rank pulling router image on $(hostname): $VLLM_ROUTER_IMAGE"
             docker pull "$VLLM_ROUTER_IMAGE" || echo "WARN: docker pull failed on $(hostname) for $VLLM_ROUTER_IMAGE (using local copy if present)"
