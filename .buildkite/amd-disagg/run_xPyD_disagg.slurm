@@ -4,7 +4,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
-#SBATCH --time=08:00:00
+#SBATCH --time=02:00:00
 #SBATCH --chdir=/tmp
 #SBATCH --output=/tmp/spur-%j.out
 #SBATCH --error=/tmp/spur-%j.err
@@ -65,7 +65,7 @@ CLUSTER_ENV_IN="${CLUSTER_ENV_IN:-${CONTAINER_SCRIPTS}/cluster.sh}"
 # Health endpoints (TP-mode ports from cluster.sh defaults).
 PREFILL_PORT="${PREFILL_PORT:-8100}"
 DECODE_PORT="${DECODE_PORT:-8200}"
-HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-2400}"
+HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-3600}"
 
 
 NUM_NODES=$((xP + yD))

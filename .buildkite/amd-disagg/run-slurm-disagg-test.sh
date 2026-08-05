@@ -37,12 +37,12 @@ IMAGE="${IMAGE:-vllm/vllm-openai-rocm:nightly}"
 NODES="${NODES:-2}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 PARTITION="${SLURM_PARTITION:-}"
-TIME_LIMIT="${SLURM_TIME_LIMIT:-01:30:00}"
+TIME_LIMIT="${SLURM_TIME_LIMIT:-02:00:00}"
 WIDE_EP_MODE="${WIDE_EP_MODE:-0}"              # 0 -> 1P1D TP8 (default); 1 -> wide-EP
 xP="${xP:-1}"
 yD="${yD:-1}"
 RUN_AFTER_HEALTH="${RUN_AFTER_HEALTH:-accuracy}"
-HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-5400}"   # P/D bring-up budget (big models load slowly)
+HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-3600}"   # P/D bring-up budget; +900s grace must fit the 2h wall
 SHARED_MOUNT="${SHARED_MOUNT:-/data}"
 LOG_ROOT="${LOG_ROOT:-${SHARED_MOUNT}/${USER:-$(whoami)}/disagg_logs}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -138,9 +138,9 @@ unset -v _h _m _s
 # Per-phase budgets (all overridable from the Buildkite step env).
 POLL_INTERVAL="${POLL_INTERVAL:-20}"
 SUBMIT_GRACE_S="${SUBMIT_GRACE_S:-900}"                        # reach RUNNING within 15m
-PENDING_MAX_S="${PENDING_MAX_S:-3600}"                          # tolerate 60m queued
+PENDING_MAX_S="${PENDING_MAX_S:-1800}"                          # tolerate 30m queued
 HEALTH_PHASE_TIMEOUT_S="${HEALTH_PHASE_TIMEOUT_S:-$(( HEALTH_TIMEOUT_S + 900 ))}"
-WORKLOAD_TIMEOUT_S="${WORKLOAD_TIMEOUT_S:-3600}"               # accuracy/bench cap
+WORKLOAD_TIMEOUT_S="${WORKLOAD_TIMEOUT_S:-1800}"               # accuracy/bench cap
 
 SENTINEL="${LOG_DIR}/.disagg_done"
 
@@ -222,7 +222,7 @@ while [[ $(date +%s) -lt ${WAIT_DEADLINE} ]]; do
                 # scontrol can't confirm the job exists (empty state) AND no log
                 # output within the grace window -> treat as a lost/failed launch.
                 # NB: a genuinely-queued job reports PENDING via scontrol above and
-                # is governed by PENDING_MAX_S (default 1h), not this grace window.
+                # is governed by PENDING_MAX_S (default 30m), not this grace window.
                 STATE="infra-nostart"; RC=1; REASON="no scheduler state or log within ${SUBMIT_GRACE_S}s"; break
             fi
             ;;

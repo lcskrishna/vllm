@@ -83,7 +83,7 @@ load_config() {
 
     # node-mode orchestration knobs
     RUN_AFTER_HEALTH="${RUN_AFTER_HEALTH:-accuracy}"     # bench | accuracy | none
-    HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-2400}"
+    HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-3600}"
 
     # MoRIIO KV transfer direction. 0 (default)
     MORIIO_READ_MODE="${MORIIO_READ_MODE:-0}"
