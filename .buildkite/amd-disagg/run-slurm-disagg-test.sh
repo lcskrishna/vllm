@@ -152,6 +152,40 @@ job_field() {  # $1=jobid  $2=field  ->  value | ""
 }
 have() { grep -aqE "$1" "${LOG_FILE}" 2>/dev/null; }
 
+# Never let the job outlive this poller. Cancelling a Buildkite build kills the
+# agent's bootstrap, and without this the sbatch job keeps its whole allocation
+# until the walltime expires. Only armed on the WAIT=1 path — under WAIT=0,
+# leaving the job running is the point.
+CANCEL_GRACE_S="${CANCEL_GRACE_S:-120}"
+_CLEANED=0
+job_active() {
+    case "$(job_field "${JOB_ID}" JobState)" in
+        RUNNING|PENDING|COMPLETING|CONFIGURING|SUSPENDED|REQUEUED) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+cleanup_job() {
+    [[ "${_CLEANED}" == "1" || -z "${JOB_ID:-}" ]] && return 0
+    _CLEANED=1
+    # A job that reported its own verdict is mid-teardown; give it a bounded
+    # moment to finish. Timeouts and infra failures get cancelled immediately —
+    # there is nothing to wait for and the nodes should come back now.
+    if [[ "${REASON:-}" == "sentinel" || "${REASON:-}" == "gate" || "${STATE:-}" == "COMPLETED" ]]; then
+        local deadline=$(( $(date +%s) + CANCEL_GRACE_S ))
+        while (( $(date +%s) < deadline )) && job_active; do sleep 5; done
+    fi
+    if job_active; then
+        echo "[slurm-submit] cleanup: cancelling job ${JOB_ID}" >&2
+        scancel "${JOB_ID}" 2>/dev/null \
+            || echo "[slurm-submit] WARN: scancel ${JOB_ID} failed; job may still hold nodes" >&2
+    fi
+    return 0
+}
+trap cleanup_job EXIT
+trap 'cleanup_job; exit 130' INT
+trap 'cleanup_job; exit 143' TERM
+trap 'cleanup_job; exit 129' HUP
+
 STATE=""
 RC=1
 REASON=""

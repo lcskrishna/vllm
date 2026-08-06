@@ -237,11 +237,13 @@ run_node_container() {
     local rank="$1"
     set -o pipefail   # propagate docker run exit code through the tee pipe
     echo "Rank $rank on $(hostname)"
-    docker rm -f "$DOCKER_CONT_NAME" 2>/dev/null || true
-    docker ps -q | xargs --no-run-if-empty docker stop;
-    local stale
-    stale=$(docker ps -aq --filter name=vllm_disagg_ 2>/dev/null) || true
-    [ -n "$stale" ] && { echo "Reaping stale containers on $(hostname): $stale"; docker rm -f $stale 2>/dev/null || true; }
+    local -a stale=()
+    mapfile -t stale < <(docker ps -aq --filter name=vllm_disagg_ --filter name=vllm_router_ 2>/dev/null || true)
+    if (( ${#stale[@]} > 0 )); then
+        echo "Reaping stale containers on $(hostname): ${stale[*]}"
+        docker stop -t 30 "${stale[@]}" >/dev/null 2>&1 || true
+        docker rm "${stale[@]}" >/dev/null 2>&1 || true
+    fi
 
     # Bind-mount the host AMD Pensando (ionic) RoCE userspace provider into the
     # container IF present: the image ships an ABI-incompatible copy and the NICs
@@ -271,7 +273,6 @@ run_node_container() {
     if [ "$ROUTER_TYPE" = "vllm-router" ] && [ "$rank" = "0" ] && [ "$DRY_RUN" = "1" ]; then
         echo "DRY_RUN: would start vllm-router on $(hostname): $VLLM_ROUTER_IMAGE (discovery :$PROXY_PING_PORT, port :$ROUTER_PORT, policy $ROUTER_POLICY, dp_local=$ROUTER_DP_LOCAL)"
     elif [ "$ROUTER_TYPE" = "vllm-router" ] && [ "$rank" = "0" ]; then
-        docker rm -f "$ROUTER_CONT_NAME" 2>/dev/null || true
         mkdir -p "$LOG_PATH" 2>/dev/null || true
         {
             echo "Starting vllm-router on $(hostname): $VLLM_ROUTER_IMAGE (discovery :$PROXY_PING_PORT, port :$ROUTER_PORT, policy $ROUTER_POLICY, dp_local=$ROUTER_DP_LOCAL)"
@@ -351,6 +352,32 @@ run_node_container() {
     return "$node_rc"
 }
 
+# Teardown of the main + external router containers on every node ($1 = docker
+# stop timeout). `docker run` containers outlive the client that started them,
+# so on scancel the srun tasks die but the containers keep the GPUs until the
+# walltime expires unless they are stopped explicitly.
+teardown_containers() {
+    export TEARDOWN_STOP_T="${1:-30}"
+    if command -v srun >/dev/null 2>&1; then
+        srun --nodelist="$SELECTED_NODELIST_STR" \
+             --nodes="$NUM_NODES" --ntasks="$NUM_NODES" --ntasks-per-node=1 \
+          bash -c 'docker stop -t "${TEARDOWN_STOP_T:-30}" "$DOCKER_CONT_NAME" >/dev/null 2>&1 || true; docker rm "$DOCKER_CONT_NAME" >/dev/null 2>&1 || true
+                   [ "$ROUTER_TYPE" = "vllm-router" ] && { docker stop -t "${TEARDOWN_STOP_T:-30}" "$ROUTER_CONT_NAME" >/dev/null 2>&1 || true; docker rm "$ROUTER_CONT_NAME" >/dev/null 2>&1 || true; }' || true
+    else
+        docker stop -t "$TEARDOWN_STOP_T" "$DOCKER_CONT_NAME" >/dev/null 2>&1 || true
+        docker rm "$DOCKER_CONT_NAME" >/dev/null 2>&1 || true
+        if [ "$ROUTER_TYPE" = "vllm-router" ]; then
+            docker stop -t "$TEARDOWN_STOP_T" "$ROUTER_CONT_NAME" >/dev/null 2>&1 || true
+            docker rm "$ROUTER_CONT_NAME" >/dev/null 2>&1 || true
+        fi
+    fi
+    return 0
+}
+
+# SLURM sends SIGTERM then SIGKILL after KillWait (30s by default), so the trap
+# uses a short stop timeout to fit inside that window.
+trap 'echo "[disagg-pd] signal received, tearing down containers"; teardown_containers 10; exit 143' TERM INT
+
 RC=0
 if command -v srun >/dev/null 2>&1; then
     # classic Slurm: fan out one task/node; ship the fn and call it with the
@@ -365,17 +392,7 @@ else
     run_node_container "${SPUR_TASK_OFFSET:-${NODE_RANK:-0}}" || RC=$?
 fi
 
-# Best-effort teardown of any lingering containers (main + external router;
-# same dispatch split).
-if command -v srun >/dev/null 2>&1; then
-    srun --nodelist="$SELECTED_NODELIST_STR" \
-         --nodes="$NUM_NODES" --ntasks="$NUM_NODES" --ntasks-per-node=1 \
-      bash -c 'docker stop "$DOCKER_CONT_NAME" 2>/dev/null || true; docker rm "$DOCKER_CONT_NAME" 2>/dev/null || true
-               [ "$ROUTER_TYPE" = "vllm-router" ] && { docker stop "$ROUTER_CONT_NAME" 2>/dev/null || true; docker rm "$ROUTER_CONT_NAME" 2>/dev/null || true; }' || true
-else
-    docker stop "$DOCKER_CONT_NAME" 2>/dev/null || true; docker rm "$DOCKER_CONT_NAME" 2>/dev/null || true
-    [ "$ROUTER_TYPE" = "vllm-router" ] && { docker stop "$ROUTER_CONT_NAME" 2>/dev/null || true; docker rm "$ROUTER_CONT_NAME" 2>/dev/null || true; }
-fi
+teardown_containers 30
 
 echo "[disagg-pd] launch finished rc=${RC}; logs in ${LOG_PATH}"
 exit "${RC}"
