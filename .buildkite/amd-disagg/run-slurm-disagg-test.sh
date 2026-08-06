@@ -158,12 +158,14 @@ have() { grep -aqE "$1" "${LOG_FILE}" 2>/dev/null; }
 # leaving the job running is the point.
 CANCEL_GRACE_S="${CANCEL_GRACE_S:-120}"
 _CLEANED=0
+# shellcheck disable=SC2329  # invoked from cleanup_job, which the traps below call
 job_active() {
     case "$(job_field "${JOB_ID}" JobState)" in
         RUNNING|PENDING|COMPLETING|CONFIGURING|SUSPENDED|REQUEUED) return 0 ;;
         *) return 1 ;;
     esac
 }
+# shellcheck disable=SC2329  # invoked from the traps below
 cleanup_job() {
     [[ "${_CLEANED}" == "1" || -z "${JOB_ID:-}" ]] && return 0
     _CLEANED=1

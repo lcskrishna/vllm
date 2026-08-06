@@ -73,6 +73,10 @@ load_config() {
     # shellcheck disable=SC1090
     source "${CLUSTER_ENV}"
 
+    # Topology fanout normally arrives from cluster.sh; restate the defaults so
+    # the rank arithmetic is defined even when it does not.
+    : "${xP:=1}" "${yD:=1}"
+
     [[ -n "${_WIDE_EP_MODE_OVERRIDE}" ]] && WIDE_EP_MODE="${_WIDE_EP_MODE_OVERRIDE}"
     WIDE_EP_MODE="${WIDE_EP_MODE:-0}"
     case "${WIDE_EP_MODE}" in

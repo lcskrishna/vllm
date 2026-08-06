@@ -55,7 +55,7 @@ exec > "$LOG_ROOT/${SLURM_JOB_NAME}-${SLURM_JOB_ID}.log" 2>&1
 # default to the known host scripts dir. Override via env if you relocate it.
 DISAGG_SCRIPTS_DIR="${DISAGG_SCRIPTS_DIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
 echo "DISAGG SCRIPTS DIR is ----"
-echo $DISAGG_SCRIPTS_DIR
+echo "$DISAGG_SCRIPTS_DIR"
 
 # In-container path the scripts are mounted to (and sourced from).
 CONTAINER_SCRIPTS="${CONTAINER_SCRIPTS:-/vllm-workspace/.buildkite/amd-disagg}"
@@ -165,7 +165,6 @@ echo "$SELECTED_NODES"
 echo ""
 
 # Node information
-USER_NAME=$(whoami)
 MASTER_NODE=$(echo "$SELECTED_NODES" | head -n 1)
 MASTER_PORT=39566  # Choose an open port
 
@@ -189,9 +188,10 @@ else
 fi
 MASTER_ADDR="${IPS[0]}"
 
-echo "Selected node IPs: ${IPS[*]}" | sed 's/ /,/g'
+IPADDRS="${IPS[*]}"
+IPADDRS="${IPADDRS// /,}"
+echo "Selected node IPs: ${IPADDRS}"
 
-timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
 NNODES=$NUM_NODES
 
 echo "MASTER_NODE is ${MASTER_NODE}"
@@ -214,7 +214,7 @@ echo "[disagg-pd] LOG_PATH=$LOG_PATH"
 #   rank 0           -> prefill master + MoRIIO proxy + orchestrator
 #   rank 1 .. xP-1   -> prefill
 #   rank xP .. end   -> decode
-export IPADDRS="$(echo "${IPS[*]}" | sed 's/ /,/g')"
+export IPADDRS
 
 export WIDE_EP_MODE xP yD GPUS_PER_NODE RUN_AFTER_HEALTH HEALTH_TIMEOUT_S DRY_RUN MORIIO_READ_MODE
 export IMAGE SHARED_MOUNT CONTAINER_SCRIPTS DISAGG_SCRIPTS_DIR
@@ -294,7 +294,7 @@ run_node_container() {
     fi
 
     docker run --rm \
-	--user $(id -u):$(id -g) \
+	--user "$(id -u):$(id -g)" \
         --device /dev/dri \
         --device /dev/kfd \
         --device /dev/infiniband \
@@ -359,6 +359,7 @@ run_node_container() {
 teardown_containers() {
     export TEARDOWN_STOP_T="${1:-30}"
     if command -v srun >/dev/null 2>&1; then
+        # shellcheck disable=SC2016  # must expand on the remote node, not here
         srun --nodelist="$SELECTED_NODELIST_STR" \
              --nodes="$NUM_NODES" --ntasks="$NUM_NODES" --ntasks-per-node=1 \
           bash -c 'docker stop -t "${TEARDOWN_STOP_T:-30}" "$DOCKER_CONT_NAME" >/dev/null 2>&1 || true; docker rm "$DOCKER_CONT_NAME" >/dev/null 2>&1 || true
