@@ -95,3 +95,21 @@ models:
       tp: "--gpu-memory-utilization 0.9"
     decode:
       tp: "--gpu-memory-utilization 0.9"
+
+  - model: Kimi-K3
+    env:
+      VLLM_ROCM_USE_AITER: "1"
+      SAFETENSORS_FAST_GPU: "1"
+      VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: "1"
+      AITER_BF16_FP8_MOE_BOUND: "0"
+      VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+    # 1.42 TB of weights on NFS is 75% of node RAM, which is under the 90%
+    # auto-prefetch threshold, so vLLM tries to pull the whole checkpoint into
+    # page cache and thrashes (job 4361: 1 of 96 shards in 16 min). `eager`
+    # skips the prefetcher and does one large sequential read per shard.
+    # No spaces inside --compilation-config: MODEL_CONFIG is word-split (read -ra).
+    base_flags: '--trust-remote-code --load-format auto --safetensors-load-strategy eager --mm-encoder-tp-mode data --max-num-seqs 128 --max-num-batched-tokens 4096 --reasoning-parser kimi_k3 --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY","custom_ops":["+fused_rms_norm_gated"]}'
+    prefill:
+      tp: "--gpu-memory-utilization 0.95"
+    decode:
+      tp: "--gpu-memory-utilization 0.95"

@@ -430,6 +430,12 @@ run_node_container() {
         } 2>&1 | tee -a "$LOG_PATH/vllm_router_start.log"
     fi
 
+    # aiter merges its tuned-GEMM configs into a HARDCODED /tmp/aiter_configs
+    # (aiter/jit/core.py: config_path = Path("/tmp/aiter_configs/")), so unlike
+    # AITER_JIT_DIR below it cannot be redirected by env var. The image ships
+    # that dir root-owned 0755 while we run --user, so the merge write fails with
+    # EACCES on <name>.csv.lock. Overlay a writable tmpfs; aiter regenerates the
+    # merged CSVs from the read-only aiter/configs/model_configs/ sources.
     docker run --rm \
 	--user "$(id -u):$(id -g)" \
         --device /dev/dri \
@@ -443,6 +449,7 @@ run_node_container() {
         --cap-add IPC_LOCK \
         --security-opt seccomp=unconfined \
         --shm-size 64G \
+        --tmpfs /tmp/aiter_configs:rw,mode=1777 \
         --ulimit nofile=1048576:1048576 \
         -v "$SHARED_MOUNT":"$SHARED_MOUNT" \
         -v "$DISAGG_SCRIPTS_DIR":"$CONTAINER_SCRIPTS" \
