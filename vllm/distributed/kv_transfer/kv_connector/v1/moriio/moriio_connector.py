@@ -22,9 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     ROLE,
+    BlockIdGroups,
     EngineId,
     HandshakeError,
     MoRIIOAgentMetadata,
@@ -37,11 +39,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     ReqMeta,
     TransferId,
     WriteTask,
+    as_wire_block_ids,
     fold_local_rank,
     get_moriio_mode,
     get_peer_zmq_from_request_id,
     get_port_offset,
     get_role,
+    normalize_block_id_groups,
     parse_moriio_zmq_address,
     pod_index,
     resolve_host_ip,
@@ -54,11 +58,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
     LayerTransferGeometry,
+    build_layer_to_group_index,
     build_layer_to_spec,
     compute_block_transfer_offsets,
     get_layer_transfer_geometry,
     is_mla_cache_layer,
     iter_layer_registration_regions,
+    recurrent_state_group_indices,
 )
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
@@ -189,7 +195,37 @@ def resolve_moriio_transfer_ack(
     return transfer_id
 
 
-class MoRIIOConnector(KVConnectorBase_V1):
+def _validate_supported_kv_cache_groups(
+    kv_cache_config: "KVCacheConfig",
+    state_group_indices: frozenset[int],
+) -> None:
+    """Fail fast on KV cache layouts whose transfer path is not implemented.
+
+    Block ids are threaded per group and each layer is addressed with its own
+    group's ids, so multiple groups are fine in themselves. What is not
+    implemented is recurrent state whose page cannot be moved as a whole:
+    anything other than a plain per-sequence state page would need the conv
+    dimension decomposed into sub-projections (compare
+    ``ssm_conv_transfer_utils``). Refuse those rather than move the wrong bytes.
+    """
+    for group_idx in sorted(state_group_indices):
+        group = kv_cache_config.kv_cache_groups[group_idx]
+        spec = group.kv_cache_spec
+        mamba_cache_mode = getattr(spec, "mamba_cache_mode", "none")
+        if mamba_cache_mode != "none":
+            raise NotImplementedError(
+                f"MoRIIOConnector cannot serve this model disaggregated: layer "
+                f"{group.layer_names[0]} uses mamba_cache_mode="
+                f"{mamba_cache_mode!r}, where more than one state block is live "
+                f"per sequence and the block holding the post-prefill state is "
+                f"not identified yet. Only mamba_cache_mode='none' is "
+                f"supported. Run it on a single instance (without "
+                f"--kv-transfer-config), or set "
+                f"--mamba-cache-mode=none."
+            )
+
+
+class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -225,7 +261,7 @@ class MoRIIOConnector(KVConnectorBase_V1):
             )
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MoRIIOConnectorScheduler | None = (
-                MoRIIOConnectorScheduler(vllm_config, self.engine_id)
+                MoRIIOConnectorScheduler(vllm_config, self.engine_id, kv_cache_config)
             )
             self.connector_worker: MoRIIOConnectorWorker | None = None
         elif role == KVConnectorRole.WORKER:
@@ -283,6 +319,14 @@ class MoRIIOConnector(KVConnectorBase_V1):
         self,
         request: "Request",
         block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request, (block_ids,))
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: BlockIdGroups,
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
@@ -368,11 +412,24 @@ class MoRIIOConnector(KVConnectorBase_V1):
 class MoRIIOConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        engine_id: str,
+        kv_cache_config: "KVCacheConfig | None" = None,
+    ):
         self.vllm_config = vllm_config
 
         assert vllm_config.kv_transfer_config is not None, (
             "kv_transfer_config must be set for MoRIIOConnector"
+        )
+        # Which groups hold recurrent state, so block-id handling can treat them
+        # differently from paged attention. Absent a config (unit tests, or a
+        # caller that predates HMA) assume a single attention group.
+        self._state_group_indices = (
+            recurrent_state_group_indices(kv_cache_config)
+            if kv_cache_config is not None
+            else frozenset()
         )
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.block_size = vllm_config.cache_config.block_size
@@ -409,14 +466,14 @@ class MoRIIOConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[int]]] = {}
-        self._reqs_need_save: dict[ReqId, tuple[Request, list[int]]] = {}
+        self._reqs_need_recv: dict[ReqId, tuple[Request, BlockIdGroups]] = {}
+        self._reqs_need_save: dict[ReqId, tuple[Request, BlockIdGroups]] = {}
         # Snapshot of kv_transfer_params for chunked prefill recovery.
         self._req_kv_params: dict[ReqId, dict] = {}
 
         # For chunked prefill, we perform layer-wise access within the final chunk.
         # TODO: Perform transfer at end chunk.
-        self._reqs_need_pending_save: dict[ReqId, tuple[Request, list[int]]] = {}
+        self._reqs_need_pending_save: dict[ReqId, tuple[Request, BlockIdGroups]] = {}
 
         if self.is_producer:
             set_role(ROLE.PRODUCER)
@@ -642,7 +699,7 @@ class MoRIIOConnectorScheduler:
         request_id = request.request_id
         self.map_request_id(request_id, transfer_id)
         if params.get("do_remote_decode"):
-            local_block_ids = blocks.get_block_ids()[0]
+            local_block_ids = normalize_block_id_groups(blocks.get_block_ids())
             self._reqs_need_save[request.request_id] = (request, local_block_ids)
             # Snapshot params now so chunked-prefill build_connector_meta
             # can recover them on the final chunk even if the live
@@ -657,17 +714,15 @@ class MoRIIOConnectorScheduler:
                     if "remote_engine_id" in params:
                         if num_external_tokens > 0:
                             # Get unhashed blocks to pull from remote.
-                            local_block_ids = blocks.get_block_ids()[0]
-                            assert len(local_block_ids) <= len(remote_block_ids)
-                            if len(local_block_ids) != len(remote_block_ids):
-                                local_block_ids = remote_block_ids[
-                                    -len(local_block_ids) :
-                                ]
+                            local_block_ids = self._align_local_to_remote_blocks(
+                                normalize_block_id_groups(blocks.get_block_ids()),
+                                normalize_block_id_groups(remote_block_ids),
+                            )
                         else:
                             # If remote_blocks and num_external_tokens = 0, we have
                             # a full prefix cache hit on the D worker. We need to call
                             # send_notify in _read_blocks to free the memory on the P.
-                            local_block_ids = []
+                            local_block_ids = ([],)
 
                         self._reqs_need_recv[request.request_id] = (
                             request,
@@ -802,6 +857,68 @@ class MoRIIOConnectorScheduler:
 
             params["do_remote_prefill"] = False
 
+    def _num_cached_tokens(self, groups: BlockIdGroups) -> int:
+        """Tokens covered by the allocated blocks, for chunked-prefill progress.
+
+        Only paged attention groups scale with sequence length -- a recurrent
+        state group holds one fixed-size block regardless of how many tokens
+        have been seen -- so token math must come from an attention group.
+        """
+        for group_idx, group in enumerate(groups):
+            if group_idx not in self._state_group_indices:
+                return len(group) * self.block_size
+        return 0
+
+    def _extend_block_id_groups(
+        self, existing: BlockIdGroups, new: BlockIdGroups
+    ) -> BlockIdGroups:
+        """Append newly allocated blocks to each group of a pending request."""
+        if len(existing) != len(new):
+            raise ValueError(
+                f"KV cache group count changed mid-request: had {len(existing)}, "
+                f"got {len(new)}"
+            )
+        return tuple(list(old) + list(added) for old, added in zip(existing, new))
+
+    def _align_local_to_remote_blocks(
+        self,
+        local_groups: BlockIdGroups,
+        remote_groups: BlockIdGroups,
+    ) -> BlockIdGroups:
+        """Line up this leg's per-group block ids with the peer's.
+
+        For paged attention groups a local prefix-cache hit means the peer holds
+        more blocks than we need, so the tail is what must be pulled. Recurrent
+        state groups are never trimmed: one block is the whole state, and it is
+        the peer's state that has to arrive intact.
+        """
+        if len(local_groups) != len(remote_groups):
+            raise ValueError(
+                "KV cache group count mismatch between decode and prefill: "
+                f"local has {len(local_groups)} group(s), remote reported "
+                f"{len(remote_groups)}. Both legs must run the same model and "
+                "the same hybrid-memory-allocator setting."
+            )
+
+        aligned: list[list[int]] = []
+        for group_idx, (local, remote) in enumerate(zip(local_groups, remote_groups)):
+            if group_idx in self._state_group_indices:
+                aligned.append(list(remote))
+                continue
+            if len(local) > len(remote):
+                raise ValueError(
+                    f"KV cache group {group_idx}: local_block_ids "
+                    f"({len(local)}) is longer than remote_block_ids "
+                    f"({len(remote)})"
+                )
+            if len(local) == len(remote):
+                aligned.append(list(local))
+            else:
+                # NOTE: preserves the pre-HMA behaviour of substituting the
+                # remote tail rather than trimming the remote list.
+                aligned.append(list(remote[-len(local) :]) if local else [])
+        return tuple(aligned)
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -818,8 +935,7 @@ class MoRIIOConnectorScheduler:
                 new_block_ids = scheduler_output.scheduled_cached_reqs.new_block_ids[i]
 
                 if new_block_ids is not None:
-                    block_ids = new_block_ids[0]
-                    # TODO : hybrid attn, etc
+                    block_id_groups = normalize_block_id_groups(new_block_ids)
                     # A non-disagg request (no kv_transfer_params, e.g. smoke
                     # test) is never registered in _reqs_need_pending_save;
                     # indexing it unconditionally would KeyError and crash the
@@ -827,12 +943,11 @@ class MoRIIOConnectorScheduler:
                     if req_id not in self._reqs_need_pending_save:
                         continue
                     req, existing_blocks = self._reqs_need_pending_save[req_id]
-                    updated_blocks = list(existing_blocks) + (block_ids)
+                    updated_blocks = self._extend_block_id_groups(
+                        existing_blocks, block_id_groups
+                    )
                     self._reqs_need_pending_save[req_id] = (req, updated_blocks)
-                    if (
-                        len(self._reqs_need_pending_save[req_id][1]) * self.block_size
-                        >= req.num_prompt_tokens
-                    ):
+                    if self._num_cached_tokens(updated_blocks) >= req.num_prompt_tokens:
                         # Final chunk: live kv_transfer_params may be cleared,
                         # so prefer the snapshot from update_state_after_alloc.
                         kv_params = self._req_kv_params.pop(
@@ -857,7 +972,7 @@ class MoRIIOConnectorScheduler:
 
         for req_id, (req, block_ids) in self._reqs_need_save.items():
             kv_params = self._req_kv_params.get(req_id, req.kv_transfer_params or {})
-            if req.num_prompt_tokens > len(block_ids) * self.block_size:
+            if req.num_prompt_tokens > self._num_cached_tokens(block_ids):
                 # not last chunk prefill
                 self._reqs_need_pending_save[req_id] = (req, block_ids)
                 continue
@@ -898,12 +1013,16 @@ class MoRIIOConnectorScheduler:
     def request_finished(
         self,
         request: "Request",
-        block_ids: list[int],
+        block_ids: BlockIdGroups | list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
+
+        ``block_ids`` carries one list per KV cache group (see BlockIdGroups); a
+        flat list is accepted as the single-group form.
         """
+        block_id_groups = normalize_block_id_groups(block_ids)
 
         request_id = request.request_id
         params = request.kv_transfer_params
@@ -936,7 +1055,7 @@ class MoRIIOConnectorScheduler:
             if self.mode == MoRIIOMode.WRITE:
                 self._release_write_prefill_blocks(request.request_id, params)
             else:
-                self._reqs_need_recv[request.request_id] = (request, [])
+                self._reqs_need_recv[request.request_id] = (request, ([],))
             params["do_remote_prefill"] = False
             return False, None
 
@@ -947,9 +1066,11 @@ class MoRIIOConnectorScheduler:
             return False, None
 
         # computed_block_ids = block_ids if all_full else block_ids[:-1]
-        computed_block_ids = block_ids
-        # If prompt < block_size, no xfer so free blocks immediately.
-        delay_free_blocks = len(computed_block_ids) > 0
+        computed_block_ids = block_id_groups
+        # If prompt < block_size, no xfer so free blocks immediately. A hybrid
+        # model must delay if ANY group holds blocks: the recurrent-state group
+        # can be non-empty on a prompt too short to fill an attention block.
+        delay_free_blocks = any(group for group in computed_block_ids)
 
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
@@ -972,7 +1093,7 @@ class MoRIIOConnectorScheduler:
         return delay_free_blocks, dict(
             do_remote_prefill=True,
             do_remote_decode=False,
-            remote_block_ids=computed_block_ids,
+            remote_block_ids=as_wire_block_ids(computed_block_ids),
             remote_engine_id=self.engine_id,
             remote_host=self.host_ip,
             remote_handshake_port=self.handshake_port,
@@ -1102,6 +1223,9 @@ class MoRIIOConnectorWorker:
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.is_producer = self.kv_transfer_config.is_kv_producer
         self.layer_to_spec = build_layer_to_spec(kv_cache_config)
+        self.layer_to_group_index = build_layer_to_group_index(kv_cache_config)
+        self._state_group_indices = recurrent_state_group_indices(kv_cache_config)
+        _validate_supported_kv_cache_groups(kv_cache_config, self._state_group_indices)
 
         if self.is_producer:
             set_role(ROLE.PRODUCER)
@@ -1676,6 +1800,46 @@ class MoRIIOConnectorWorker:
     def _is_mla_cache_layer(self, layer_name: str) -> bool:
         return is_mla_cache_layer(self.layer_to_spec, layer_name)
 
+    def _is_recurrent_state_layer(self, layer_name: str) -> bool:
+        return self.layer_to_group_index.get(layer_name) in self._state_group_indices
+
+    def _validate_hybrid_peer_tp(self, remote_tp_size: int | None) -> None:
+        """Recurrent state is only transferable between equal-TP engines.
+
+        A state page is moved whole, so both sides must shard it identically.
+        Under heterogeneous TP each rank owns a different slice of the conv
+        dimension and the page would have to be split into sub-projections
+        (compare ``ssm_conv_transfer_utils``), which is not implemented.
+        """
+        if not self._state_group_indices:
+            return
+        if not remote_tp_size or remote_tp_size <= 0:
+            # 0/None means "unknown", which MoRIIO treats as homogeneous.
+            return
+        if int(remote_tp_size) != int(self.world_size):
+            raise NotImplementedError(
+                f"MoRIIO cannot transfer recurrent state between engines with "
+                f"different tensor-parallel sizes (local TP={self.world_size}, "
+                f"peer TP={remote_tp_size}). Run both legs with the same "
+                f"--tensor-parallel-size."
+            )
+
+    def _layer_block_ids(
+        self,
+        layer_name: str,
+        local_groups: BlockIdGroups,
+        remote_groups: BlockIdGroups,
+    ) -> tuple[list[int], list[int]]:
+        """The (local, remote) block ids belonging to this layer's group.
+
+        Falls back to the primary group when a peer described only one group,
+        which is what a homogeneous model always sends.
+        """
+        group_idx = self.layer_to_group_index.get(layer_name, 0)
+        local = local_groups[group_idx] if group_idx < len(local_groups) else []
+        remote = remote_groups[group_idx] if group_idx < len(remote_groups) else []
+        return list(local), list(remote)
+
     def _get_layer_transfer_geometry(
         self, layer_name: str, remote_num_blocks: int | None = None
     ) -> LayerTransferGeometry:
@@ -1703,17 +1867,31 @@ class MoRIIOConnectorWorker:
             layer_name: kv_cache.shape for layer_name, kv_cache in kv_caches.items()
         }
 
+        # Reference layer for the engine-wide geometry advertised in the
+        # handshake. Recurrent-state layers are never eligible: their page
+        # layout describes fixed per-sequence state, not paged attention
+        # blocks, so a peer sizing attention transfers from it would be wrong.
+        _attn_caches = {
+            layer_name: kv_cache
+            for layer_name, kv_cache in kv_caches.items()
+            if not self._is_recurrent_state_layer(layer_name)
+        }
+        if not _attn_caches:
+            raise NotImplementedError(
+                "MoRIIOConnector requires at least one attention layer; this "
+                "model's KV cache is entirely recurrent state."
+            )
         first_layer_name, first_kv_cache = next(
             (
                 (layer_name, kv_cache)
-                for layer_name, kv_cache in kv_caches.items()
+                for layer_name, kv_cache in _attn_caches.items()
                 if (
                     not self._is_mla_cache_layer(layer_name)
                     and len(kv_cache.shape) == 5
                     and (kv_cache.shape[0] == 2 or kv_cache.shape[1] == 2)
                 )
             ),
-            next(iter(kv_caches.items())),
+            next(iter(_attn_caches.items())),
         )
         kv_elem_size = first_kv_cache.element_size()
 
@@ -1757,10 +1935,32 @@ class MoRIIOConnectorWorker:
 
         for layer_name in kv_caches:
             geometry = self._get_layer_transfer_geometry(layer_name)
-            if geometry.block_size != self.block_size:
+            # Attention layers must agree on block_size because block ids are
+            # interchangeable within their group. A recurrent-state group has
+            # its own block table and its own page size, so it is exempt.
+            if (
+                geometry.block_size != self.block_size
+                and not self._is_recurrent_state_layer(layer_name)
+            ):
                 raise ValueError(
                     "MoRIIO KV cache block size mismatch for layer "
                     f"{layer_name}: {geometry.block_size} != {self.block_size}"
+                )
+            # The handshake advertises ONE num_blocks (the reference attention
+            # layer's), and a peer applies it to every layer whose remote K/V
+            # stride is derived from it. A layer with a different depth would
+            # therefore be addressed with the wrong stride.
+            if (
+                geometry.remote_kv_stride is not None
+                and geometry.num_blocks != self.num_blocks
+            ):
+                raise NotImplementedError(
+                    f"MoRIIOConnector cannot serve this model disaggregated: "
+                    f"layer {layer_name} holds {geometry.num_blocks} blocks but "
+                    f"the handshake advertises {self.num_blocks}, and this "
+                    f"layer's split K/V layout needs the peer's real depth to "
+                    f"locate the V region. Per-layer handshake geometry is not "
+                    f"implemented."
                 )
             self.block_lens[layer_name] = geometry.block_len
             for cache, region_len in self._iter_layer_registration_regions(layer_name):
@@ -2382,6 +2582,8 @@ class MoRIIOConnectorWorker:
             remote_dp_rank=meta.remote_dp_rank,
             chosen_tp=chosen_tp,
             flexible=flexible,
+            local_block_id_groups=meta.local_block_id_groups,
+            remote_block_id_groups=meta.remote_block_id_groups,
         )
 
     def _write_blocks_for_req(self, req_id: ReqId, meta: ReqMeta, layer_name, kv_layer):
@@ -2397,12 +2599,22 @@ class MoRIIOConnectorWorker:
             self.remote_dp_size_local = int(meta.remote_dp_size_local)
         else:
             self.remote_dp_size_local = int(meta.remote_dp_size)
+        self._validate_hybrid_peer_tp(meta.tp_size)
+        # This layer writes the block ids of its own KV cache group; see
+        # _layer_block_ids.
+        layer_local_ids, layer_remote_ids = self._layer_block_ids(
+            layer_name,
+            meta.local_block_id_groups,
+            meta.remote_block_id_groups,
+        )
         self.schedule_write_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,
             dst_engine_id=meta.remote_engine_id,
-            local_block_ids=meta.local_block_ids,
-            remote_block_ids=meta.remote_block_ids,
+            local_block_ids=layer_local_ids,
+            # A WRITE-mode peer may not have allocated yet; preserve the
+            # "no hint" signal rather than sending an empty list.
+            remote_block_ids=layer_remote_ids if meta.remote_block_ids else None,
             layer_name=layer_name,
             kv_layer=kv_layer,
             remote_notify_port=meta.remote_notify_port,
@@ -2551,9 +2763,23 @@ class MoRIIOConnectorWorker:
         remote_dp_rank: int = 0,
         chosen_tp: int | None = None,
         flexible: bool = False,
+        local_block_id_groups: BlockIdGroups | None = None,
+        remote_block_id_groups: BlockIdGroups | None = None,
     ) -> None:
         if self.mode == MoRIIOMode.WRITE:
             return
+
+        # Each layer must be addressed with the block ids of ITS KV cache group;
+        # a hybrid model's attention and state groups have independent block
+        # tables. The flat arguments describe the primary attention group and
+        # stand in when a caller has nothing more specific.
+        local_groups = local_block_id_groups or normalize_block_id_groups(
+            local_block_ids
+        )
+        remote_groups = remote_block_id_groups or normalize_block_id_groups(
+            remote_block_ids
+        )
+        self._validate_hybrid_peer_tp(remote_tp_size)
 
         # Read from the prefill rank that actually computed this request's KV
         # (forwarded by the proxy). Hardcoding DP0 reads from a different rank's
@@ -2582,14 +2808,19 @@ class MoRIIOConnectorWorker:
 
         # SQ-full backpressure deadline, shared across this request's layers.
         _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout
-        for layer_name in self.layer_name_to_local_kv_cache_metadata:
-            sess_idx = list(self.layer_name_to_local_kv_cache_metadata.keys()).index(
-                layer_name
+        for sess_idx, layer_name in enumerate(
+            self.layer_name_to_local_kv_cache_metadata
+        ):
+            # NOTE: an empty list is not skipped. A full local prefix hit posts
+            # an empty read per layer on purpose, because completion of these
+            # transfers is what notifies the prefill leg to free its blocks.
+            layer_local_ids, layer_remote_ids = self._layer_block_ids(
+                layer_name, local_groups, remote_groups
             )
             offs = self._compute_block_transfer_offsets(
                 layer_name,
-                local_block_ids,
-                remote_block_ids,
+                layer_local_ids,
+                layer_remote_ids,
                 remote_moriio_meta,
                 remote_tp_size=remote_tp_size,
             )

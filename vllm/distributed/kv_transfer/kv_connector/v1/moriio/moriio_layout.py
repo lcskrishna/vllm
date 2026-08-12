@@ -10,6 +10,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
@@ -45,6 +46,39 @@ def build_layer_to_spec(kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec
                 {layer_name: group_spec for layer_name in group.layer_names}
             )
     return layer_to_spec
+
+
+def is_recurrent_state_spec(spec: KVCacheSpec) -> bool:
+    """True if the spec holds recurrent state rather than paged attention blocks.
+
+    Linear-attention / SSM layers (Mamba, GDN, Kimi Delta Attention) keep a
+    fixed-size state per sequence slot instead of one entry per token, so a
+    "block" is the whole state and can never be split or suffix-trimmed the way
+    an attention block range can.
+    """
+    return isinstance(spec, MambaSpec)
+
+
+def build_layer_to_group_index(kv_cache_config: KVCacheConfig) -> dict[str, int]:
+    """Map layer name -> index of its group in ``kv_cache_config.kv_cache_groups``.
+
+    The index is what block-id tuples are keyed by (see BlockIdGroups), so this
+    is how a layer finds the block ids that belong to it.
+    """
+    return {
+        layer_name: group_idx
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
+        for layer_name in group.layer_names
+    }
+
+
+def recurrent_state_group_indices(kv_cache_config: KVCacheConfig) -> frozenset[int]:
+    """Group indices whose cache is recurrent state instead of paged blocks."""
+    return frozenset(
+        group_idx
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
+        if is_recurrent_state_spec(group.kv_cache_spec)
+    )
 
 
 def is_mla_cache_layer(
@@ -98,6 +132,57 @@ def _select_kernel_block_layout(
     )
 
 
+def _recurrent_state_geometry(
+    layer_name: str,
+    kv_cache: torch.Tensor,
+    spec: MambaSpec,
+) -> LayerTransferGeometry:
+    """Geometry for a linear-attention / SSM layer's state pages.
+
+    vLLM hands these layers a single contiguous int8 page view shaped
+    ``[num_blocks, 1, 1, page_size_bytes]`` (see ``_allocate_kv_cache_tensors``
+    in the GPU model runner), where one page holds that layer's whole conv +
+    temporal state for a sequence slot. So the page is the atomic transfer unit:
+    one region, one transfer per block, no K/V split and no per-token slots.
+
+    Only whole-page transfer is implemented, which requires both engines to lay
+    the page out identically -- true for equal TP, since the state is sharded the
+    same way on both sides. Heterogeneous TP would need the conv dimension
+    decomposed into its sub-projections (compare ``ssm_conv_transfer_utils``) and
+    is rejected by the caller.
+    """
+    shape = kv_cache.shape
+    if len(shape) != 4 or shape[1] != 1 or shape[2] != 1:
+        raise ValueError(
+            f"Unsupported MoRIIO recurrent-state cache shape for layer "
+            f"{layer_name}: {tuple(shape)}; expected a "
+            f"[num_blocks, 1, 1, page_size_bytes] page view"
+        )
+
+    num_blocks = shape[0]
+    page_size_bytes = shape[3] * kv_cache.element_size()
+    if page_size_bytes != spec.page_size_bytes:
+        raise ValueError(
+            f"Recurrent-state page size mismatch for layer {layer_name}: "
+            f"tensor holds {page_size_bytes} bytes per page, spec expects "
+            f"{spec.page_size_bytes}"
+        )
+
+    return LayerTransferGeometry(
+        num_blocks=num_blocks,
+        block_size=spec.block_size,
+        block_len=page_size_bytes,
+        # A state page has no per-token subdivision; the page is indivisible.
+        slot_size_bytes=page_size_bytes,
+        block_stride=kv_cache.stride()[0],
+        local_kv_stride=None,
+        remote_kv_stride=None,
+        transfers_per_block=1,
+        regions_per_block=1,
+        split_kv_regions=False,
+    )
+
+
 def get_layer_transfer_geometry(
     layer_name: str,
     kv_cache: torch.Tensor,
@@ -109,6 +194,9 @@ def get_layer_transfer_geometry(
     element_size = kv_cache.element_size()
     spec = layer_to_spec[layer_name]
     is_mla_cache = is_mla_cache_layer(layer_to_spec, layer_name)
+
+    if is_recurrent_state_spec(spec):
+        return _recurrent_state_geometry(layer_name, kv_cache, spec)
 
     if is_mla_cache and len(shape) == 3:
         num_blocks, block_size, latent_dim = shape

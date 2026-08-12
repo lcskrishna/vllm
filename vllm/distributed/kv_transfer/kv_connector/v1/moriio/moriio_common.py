@@ -4,7 +4,7 @@ import contextlib
 import os
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -41,6 +41,44 @@ Transfer = tuple[int, float]
 EngineId = str
 ReqId = str
 TransferId = str
+
+# Block ids for every KV cache group of a request, indexed by the group's
+# position in ``KVCacheConfig.kv_cache_groups``. Hybrid models (e.g. interleaved
+# MLA + linear-attention) allocate one list per group; homogeneous models have a
+# single group, so the tuple has length 1.
+BlockIdGroups = tuple[list[int], ...]
+
+
+def normalize_block_id_groups(
+    block_ids: "BlockIdGroups | Sequence[Sequence[int]] | Sequence[int] | None",
+) -> BlockIdGroups:
+    """Coerce either block-id shape into the per-group form.
+
+    Accepts a flat sequence of ids (single KV cache group -- the shape used by
+    the non-HMA ``request_finished`` API and by peers that predate hybrid
+    support) or an already-grouped sequence of lists, so both wire formats
+    round-trip through the connector unchanged. Ids are passed through as-is
+    rather than coerced, since callers legitimately hand over block objects.
+    """
+    if not block_ids:
+        return ([],)
+    if isinstance(block_ids[0], (list, tuple)):
+        return tuple(list(group) for group in block_ids)
+    return (list(block_ids),)  # type: ignore[arg-type]
+
+
+def as_wire_block_ids(
+    groups: BlockIdGroups,
+) -> "list[int] | list[list[int]]":
+    """Render per-group block ids for ``kv_transfer_params``.
+
+    A single group is sent flat so a hybrid-aware prefill leg stays readable by
+    a peer that only understands the original format; multi-group requests are
+    sent as a list of lists. ``normalize_block_id_groups`` accepts both.
+    """
+    if len(groups) == 1:
+        return list(groups[0])
+    return [list(group) for group in groups]
 
 
 class MoRIIOTransferAck(NamedTuple):
@@ -443,6 +481,9 @@ class ReqMeta:
     """Metadata for a single request."""
 
     transfer_id: TransferId
+    # Block ids of the primary paged-attention group. Kept flat because every
+    # transfer path is indexed by it; ``*_block_id_groups`` below carries the
+    # full per-group view used by hybrid (multi-group) models.
     local_block_ids: list[int]
     remote_block_ids: list[int]
     remote_host: str
@@ -460,6 +501,10 @@ class ReqMeta:
     multi_pod_hosts: list[str] = field(default_factory=list)
     # Per-pod DP size; 0 means fallback to remote_dp_size.
     remote_dp_size_local: int = 0
+    # Per-KV-cache-group block ids (index == group index). Length 1 for
+    # homogeneous models, in which case group 0 mirrors the flat fields above.
+    local_block_id_groups: BlockIdGroups = field(default_factory=lambda: ([],))
+    remote_block_id_groups: BlockIdGroups = field(default_factory=lambda: ([],))
 
 
 class MoRIIOConnectorMetadata(KVConnectorMetadata):
@@ -480,7 +525,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
     def add_new_req(
         self,
         request_id: ReqId,
-        local_block_ids: list[int],
+        local_block_ids: BlockIdGroups | list[int],
         kv_transfer_params: dict[str, Any],
         write_mode=False,
     ):
@@ -555,10 +600,18 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             )
         )
 
+        # Both legs may describe blocks flat (single group) or per group; keep
+        # the grouped view alongside the flat primary-group view.
+        _raw_remote = kv_transfer_params["remote_block_ids"]
+        _local_groups = normalize_block_id_groups(local_block_ids)
+        _remote_groups = normalize_block_id_groups(_raw_remote)
+
         _req = ReqMeta(
             transfer_id=transfer_id,
-            local_block_ids=local_block_ids,
-            remote_block_ids=kv_transfer_params["remote_block_ids"],
+            local_block_ids=_local_groups[0],
+            # Preserve a peer's explicit None (no allocation yet in WRITE mode)
+            # instead of flattening it into an empty list.
+            remote_block_ids=_remote_groups[0] if _raw_remote is not None else None,
             remote_engine_id=kv_transfer_params["remote_engine_id"],
             remote_host=remote_host,
             remote_port=int(remote_handshake_port),
@@ -577,6 +630,8 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
             multi_pod_hosts=_pod_hosts,
             remote_dp_size_local=_remote_dp_size_local,
+            local_block_id_groups=_local_groups,
+            remote_block_id_groups=_remote_groups,
         )
         if write_mode:
             self.reqs_to_save[request_id] = _req
