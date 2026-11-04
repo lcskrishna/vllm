@@ -37,6 +37,12 @@ IMAGE="${IMAGE:-vllm/vllm-openai-rocm:nightly}"
 NODES="${NODES:-2}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 PARTITION="${SLURM_PARTITION:-}"
+ACCOUNT="${SLURM_ACCOUNT:-}"
+QOS="${SLURM_QOS:-}"
+SLURM_LOG_DIR="${SLURM_LOG_DIR:-}"
+# Optional sbatch --nodelist, e.g. host-[081,082]. MoRI-IO fails between nodes whose
+# RoCE MTUs differ, so pin a matched pair on clusters with mixed MTUs.
+NODELIST="${NODELIST:-}"
 TIME_LIMIT="${SLURM_TIME_LIMIT:-03:00:00}"
 WIDE_EP_MODE="${WIDE_EP_MODE:-0}"              # 0 -> 1P1D TP8 (default); 1 -> wide-EP
 xP="${xP:-1}"
@@ -76,12 +82,24 @@ export ROUTER_TYPE ROUTER_PORT VLLM_ROUTER_IMAGE
 export SKIP_IONIC_MOUNTS
 # Bake a different repo.radeon.com ionic userspace channel into the run image.
 export AINIC_SWAP_CHANNEL
+# Bake vLLM source patches (paths relative to this dir, space-separated) into the run image.
+export VLLM_PATCHES
 
 # Model selection.
 [[ -n "${MODEL_NAME:-}" ]] && export MODEL_NAME
 [[ -n "${MODEL_DIR:-}" ]] && export MODEL_DIR
 
-[[ -n "${PARTITION}" ]] && echo "[slurm-submit] NOTE: PARTITION='${PARTITION}' ignored (Spur sbatch has no --partition)" >&2
+SBATCH_ARGS=(--time="${TIME_LIMIT}")
+[[ -n "${ACCOUNT}" ]] && SBATCH_ARGS+=(--account="${ACCOUNT}")
+[[ -n "${PARTITION}" ]] && SBATCH_ARGS+=(--partition="${PARTITION}")
+[[ -n "${QOS}" ]] && SBATCH_ARGS+=(--qos="${QOS}")
+[[ -n "${NODELIST}" ]] && SBATCH_ARGS+=(--nodelist="${NODELIST}")
+# The job script's own --output/--error point at node-local /tmp, which is gone
+# with the allocation; set this to keep the scheduler's stdout/stderr on shared FS.
+if [[ -n "${SLURM_LOG_DIR}" ]]; then
+    mkdir -p "${SLURM_LOG_DIR}"
+    SBATCH_ARGS+=(--output="${SLURM_LOG_DIR}/spur-%j.out" --error="${SLURM_LOG_DIR}/spur-%j.err")
+fi
 
 SUBMIT_SCRIPT="${JOB_SCRIPT}"
 FILE_NODES="$(grep -oE '^#SBATCH[[:space:]]+--nodes=[0-9]+' "${JOB_SCRIPT}" | grep -oE '[0-9]+' | head -n1)"
@@ -108,8 +126,8 @@ if [[ -n "${SBATCH_RESERVATION:-}" ]]; then
     fi
 fi
 
-echo "[slurm-submit] image=${IMAGE} nodes=${NODES} gpus/node=${GPUS_PER_NODE} mode=$([[ ${WIDE_EP_MODE} == 0 ]] && echo tp || echo ep) router=${ROUTER_TYPE} walltime=${TIME_LIMIT}"
-SUBMIT_OUT="$(sbatch --time="${TIME_LIMIT}" "${SUBMIT_SCRIPT}")"
+echo "[slurm-submit] image=${IMAGE} nodes=${NODES} gpus/node=${GPUS_PER_NODE} mode=$([[ ${WIDE_EP_MODE} == 0 ]] && echo tp || echo ep) router=${ROUTER_TYPE} walltime=${TIME_LIMIT} account=${ACCOUNT:-<default>} partition=${PARTITION:-<default>} qos=${QOS:-<default>} nodelist=${NODELIST:-<any>}"
+SUBMIT_OUT="$(sbatch "${SBATCH_ARGS[@]}" "${SUBMIT_SCRIPT}")"
 echo "${SUBMIT_OUT}"
 # "Submitted batch job 114" -> 114 (last integer on the line).
 JOB_ID="$(printf '%s\n' "${SUBMIT_OUT}" | grep -oE '[0-9]+' | tail -n1 || true)"
@@ -127,6 +145,7 @@ LOG_FILE="${LOG_ROOT}/${JOB_NAME}-${JOB_ID}.log"
 LOG_DIR="${LOG_ROOT}/${JOB_ID}"
 echo "[slurm-submit] job log:  ${LOG_FILE}"
 echo "[slurm-submit] role logs: ${LOG_DIR}/"
+[[ -n "${SLURM_LOG_DIR}" ]] && echo "[slurm-submit] scheduler out/err: ${SLURM_LOG_DIR}/spur-${JOB_ID}.{out,err}"
 
 # --- Spur-safe by default: fire-and-forget --------------------------------------
 if [[ "${WAIT}" != "1" ]]; then

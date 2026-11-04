@@ -228,6 +228,9 @@ run_accuracy() {
     log "log=${logf} results=${outdir}"
 
     # --output_path makes lm_eval persist a results_*.json for scraping. 
+    # ACCURACY_LOG_SAMPLES=1 also keeps every prompt and response (samples_*.jsonl).
+    local samples=()
+    if [[ "${ACCURACY_LOG_SAMPLES:-0}" == 1 ]]; then samples=(--log_samples); fi
     local eval_rc=0
     ( set -o pipefail
       # Model weights are already served (loaded offline in a separate process);
@@ -236,7 +239,7 @@ run_accuracy() {
       python3 -m lm_eval --model "${lm_model}" \
         --tasks "${ACCURACY_TASKS}" \
         --model_args "model=${MODEL_PATH},base_url=${base_url},num_concurrent=${ACCURACY_NUM_CONCURRENT},max_retries=${ACCURACY_MAX_RETRIES},tokenized_requests=False,trust_remote_code=True,timeout=${ACCURACY_TIMEOUT:-3600}" \
-        "${chat[@]}" --output_path "${outdir}" \
+        "${chat[@]}" --output_path "${outdir}" "${samples[@]}" \
         2>&1 | tee "${logf}"
     ) || eval_rc=$?
     if (( eval_rc != 0 )); then
