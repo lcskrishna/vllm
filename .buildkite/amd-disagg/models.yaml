@@ -46,6 +46,22 @@ models:
       tp: "--gpu-memory-utilization 0.85"
       ep: '--gpu-memory-utilization 0.75 --compilation-config {"cudagraph_mode":"PIECEWISE","custom_ops":["+quant_fp8"]}'
 
+  - model: DeepSeek-R1-0528
+    env:
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_USE_AITER_MLA: "1"
+      VLLM_ROCM_USE_AITER_MOE: "1"
+      VLLM_ROCM_USE_AITER_RMSNORM: "1"
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "0"
+      VLLM_ROCM_USE_AITER_FP8BMM: "false"
+    base_flags: "--trust-remote-code --kv-cache-dtype fp8"
+    prefill:
+      tp: "--gpu-memory-utilization 0.85"
+      ep: "--gpu-memory-utilization 0.75 --enforce-eager"
+    decode:
+      tp: "--gpu-memory-utilization 0.85"
+      ep: '--gpu-memory-utilization 0.75 --compilation-config {"cudagraph_mode":"PIECEWISE","custom_ops":["+quant_fp8"]}'
+
   - model: MiniMax-M3-MXFP8
     env:
       VLLM_ROCM_USE_AITER: "1"

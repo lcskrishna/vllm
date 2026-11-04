@@ -19,7 +19,11 @@ yD="${yD:-1}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 
 SHARED_MOUNT="${SHARED_MOUNT:-/data}"
-LOG_ROOT="${LOG_ROOT:-/data/${USER:-$(id -un)}/disagg_logs}"
+LOG_ROOT="${LOG_ROOT:-${SHARED_MOUNT}/${USER:-$(id -un)}/disagg_logs}"
+# Host dir mounted as the container's HOME (/workspace). Must exist before
+# `docker run`, or docker creates it root-owned and the --user container can't write.
+WORKSPACE_DIR="${WORKSPACE_DIR:-${SHARED_MOUNT}/$(id -un)}"
+mkdir -p "$WORKSPACE_DIR"
 RUN_AFTER_HEALTH="${RUN_AFTER_HEALTH:-accuracy}"   # bench | accuracy
 DRY_RUN="${DRY_RUN:-0}"
 MORIIO_READ_MODE="${MORIIO_READ_MODE:-0}"   # 0 -> prefill writes (default); 1 -> decode reads KV (read_mode)
@@ -234,7 +238,7 @@ echo "[disagg-pd] LOG_PATH=$LOG_PATH"
 export IPADDRS
 
 export WIDE_EP_MODE xP yD GPUS_PER_NODE RUN_AFTER_HEALTH HEALTH_TIMEOUT_S DRY_RUN MORIIO_READ_MODE KV_CONNECTOR
-export IMAGE SHARED_MOUNT CONTAINER_SCRIPTS DISAGG_SCRIPTS_DIR
+export IMAGE SHARED_MOUNT WORKSPACE_DIR CONTAINER_SCRIPTS DISAGG_SCRIPTS_DIR
 export CLUSTER_ENV="${CLUSTER_ENV_IN}"
 export DOCKER_CONT_NAME="vllm_disagg_${MODEL_NAME:-model}_${SLURM_JOB_ID}"
 
@@ -477,6 +481,53 @@ run_node_container() {
         RUN_IMAGE="$ainic_tag"
     fi
 
+    # Apply vLLM source patches the image does not have yet, e.g. an open PR's
+    # fix. VLLM_PATCHES lists patch files relative to the scripts dir. Patching
+    # site-packages needs root too, so like the ionic swap this is baked into a
+    # committed image, keyed on the source image and the patch contents.
+    if [ -n "${VLLM_PATCHES:-}" ]; then
+        local vp vp_sum vp_src vp_tag vp_cont vp_rc
+        local -a vp_files=() vp_args=()
+        for vp in $VLLM_PATCHES; do
+            if [ ! -f "$DISAGG_SCRIPTS_DIR/$vp" ]; then
+                echo "ERROR: rank $rank: VLLM_PATCHES entry not found: $DISAGG_SCRIPTS_DIR/$vp" >&2
+                return 1
+            fi
+            vp_files+=("$DISAGG_SCRIPTS_DIR/$vp")
+            vp_args+=("$CONTAINER_SCRIPTS/$vp")
+        done
+        if [ "$DRY_RUN" = "1" ]; then
+            echo "DRY_RUN: rank $rank would bake vllm patches into $RUN_IMAGE: $VLLM_PATCHES"
+        else
+            vp_sum=$(cat "${vp_files[@]}" | sha256sum | cut -c1-12)
+            vp_src=$(docker image inspect -f '{{.Id}}' "$RUN_IMAGE" 2>/dev/null | cut -d: -f2 | cut -c1-12)
+            vp_tag="vllm-disagg-patched:${vp_sum}-${vp_src:-unknown}"
+            if docker image inspect "$vp_tag" >/dev/null 2>&1; then
+                echo "Rank $rank vllm patches: reusing $vp_tag ($VLLM_PATCHES)"
+            else
+                echo "Rank $rank vllm patches: building $vp_tag from $RUN_IMAGE ($VLLM_PATCHES)"
+                vp_cont="vllm-patch-${SLURM_JOB_ID:-0}-${rank}"
+                docker stop -t 30 "$vp_cont" >/dev/null 2>&1 || true
+                docker rm "$vp_cont" >/dev/null 2>&1 || true
+                if docker run --name "$vp_cont" --user 0:0 --network host \
+                        -v "$DISAGG_SCRIPTS_DIR":"$CONTAINER_SCRIPTS":ro \
+                        --entrypoint /bin/bash "$RUN_IMAGE" \
+                        "$CONTAINER_SCRIPTS/apply_vllm_patches.sh" "${vp_args[@]}" \
+                   && docker commit "$vp_cont" "$vp_tag" >/dev/null; then
+                    echo "Rank $rank vllm patches: committed $vp_tag"
+                    vp_rc=0
+                else
+                    echo "ERROR: rank $rank vllm patches ($VLLM_PATCHES) failed on $(hostname)" >&2
+                    vp_rc=1
+                fi
+                docker stop -t 30 "$vp_cont" >/dev/null 2>&1 || true
+                docker rm "$vp_cont" >/dev/null 2>&1 || true
+                [ "$vp_rc" = "0" ] || return 1
+            fi
+            RUN_IMAGE="$vp_tag"
+        fi
+    fi
+
     # Start the external vLLM router as a SEPARATE container on the rank-0 node.
     if [ "$ROUTER_TYPE" = "vllm-router" ] && [ "$rank" = "0" ] && [ "$DRY_RUN" = "1" ]; then
         echo "DRY_RUN: would start vllm-router on $(hostname): $VLLM_ROUTER_IMAGE (discovery :$PROXY_PING_PORT, port :$ROUTER_PORT, policy $ROUTER_POLICY, dp_local=$ROUTER_DP_LOCAL)"
@@ -490,7 +541,7 @@ run_node_container() {
                 --user "$(id -u):$(id -g)" \
                 -v "$LOG_PATH":/run_logs \
                 -v "$SHARED_MOUNT":"$SHARED_MOUNT" \
-                -v "/data/$(id -un):/workspace" \
+                -v "$WORKSPACE_DIR":/workspace \
                 -e HOME=/workspace \
                 -e USER="$(id -un)" \
                 -e LOGNAME="$(id -un)" \
@@ -517,7 +568,7 @@ run_node_container() {
         --ulimit nofile=1048576:1048576 \
         -v "$SHARED_MOUNT":"$SHARED_MOUNT" \
         -v "$DISAGG_SCRIPTS_DIR":"$CONTAINER_SCRIPTS" \
-        -v "/data/$(id -un):/workspace" \
+        -v "$WORKSPACE_DIR":/workspace \
         "${IONIC_MOUNTS[@]}" \
         --ulimit memlock=-1:-1 \
         -e HF_TOKEN \
@@ -537,8 +588,10 @@ run_node_container() {
         -e xP="$xP" -e yD="$yD" \
         -e GPUS_PER_NODE="$GPUS_PER_NODE" \
         -e CLUSTER_ENV="$CLUSTER_ENV" \
+        -e CLUSTER_SERVE_FLAGS -e MORI_IB_PATH_MTU -e ACCURACY_LOG_SAMPLES \
         -e MODEL_NAME="${MODEL_NAME:-}" \
         -e MODEL_DIR="${MODEL_DIR:-}" \
+        -e SHARED_MOUNT="$SHARED_MOUNT" \
         -e LOG_PATH="$LOG_PATH" \
         -e RUN_AFTER_HEALTH="$RUN_AFTER_HEALTH" \
         -e HEALTH_TIMEOUT_S="$HEALTH_TIMEOUT_S" \

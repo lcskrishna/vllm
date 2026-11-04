@@ -200,6 +200,9 @@ run_accuracy() {
     log "log=${logf} results=${outdir}"
 
     # --output_path makes lm_eval persist a results_*.json for scraping. 
+    # ACCURACY_LOG_SAMPLES=1 also keeps every prompt and response (samples_*.jsonl).
+    local samples=()
+    if [[ "${ACCURACY_LOG_SAMPLES:-0}" == 1 ]]; then samples=(--log_samples); fi
     local eval_rc=0
     ( set -o pipefail
       # Model weights are already served (loaded offline in a separate process);
@@ -208,7 +211,7 @@ run_accuracy() {
       python3 -m lm_eval --model local-completions \
         --tasks "${ACCURACY_TASKS}" \
         --model_args "model=${MODEL_PATH},base_url=${base_url},num_concurrent=${ACCURACY_NUM_CONCURRENT},max_retries=${ACCURACY_MAX_RETRIES},tokenized_requests=False,trust_remote_code=True,timeout=${ACCURACY_TIMEOUT:-3600}" \
-        --output_path "${outdir}" \
+        --output_path "${outdir}" "${samples[@]}" \
         2>&1 | tee "${logf}"
     ) || eval_rc=$?
     if (( eval_rc != 0 )); then
@@ -261,6 +264,8 @@ PY
 
 # Read model-specific flags from models.yaml (mode + role aware) into globals:
 #   MODEL_BASE_FLAGS / MODEL_ROLE_FLAGS / MODEL_EXPERIMENTAL_FLAGS -> MODEL_CONFIG
+# CLUSTER_SERVE_FLAGS (from the cluster env) is appended after them, so it
+# overrides models.yaml.
 # Also exports the model's env: block (only if not already set; caller env wins).
 load_model_flags() {
     [[ -f "${MODELS_YAML}" ]] || die "models.yaml not found: ${MODELS_YAML}"
@@ -295,7 +300,7 @@ for k, v in (cfg.get("env", {}) or {}).items():
         print(f"export {k}={q(v)}")
 PY
 )"
-    MODEL_CONFIG="${MODEL_BASE_FLAGS} ${MODEL_ROLE_FLAGS} ${MODEL_EXPERIMENTAL_FLAGS}"
+    MODEL_CONFIG="${MODEL_BASE_FLAGS} ${MODEL_ROLE_FLAGS} ${MODEL_EXPERIMENTAL_FLAGS} ${CLUSTER_SERVE_FLAGS:-}"
 }
 
 # Build the TP-mode (WIDE_EP_MODE=0) serve command into the global CMD array.
@@ -355,11 +360,14 @@ build_ep_cmd() {
         CMD+=(--gpu-memory-utilization 0.75)
     fi
 
-    if [[ "${IS_MASTER}" == "1" ]]; then
-        CMD+=(--api-server-count="${GPUS_PER_NODE}")
-        local kv_cfg read_mode_kv
-        read_mode_kv="$(moriio_read_mode_kv)"
-        kv_cfg=$(cat <<EOF
+    local kv_cfg read_mode_kv peer_hosts
+    read_mode_kv="$(moriio_read_mode_kv)"
+    if [[ "${ROLE}" == "prefill" ]]; then
+        peer_hosts=$(printf '"%s",' "${IP_ARRAY[@]:xP:yD}")
+    else
+        peer_hosts=$(printf '"%s",' "${IP_ARRAY[@]:0:xP}")
+    fi
+    kv_cfg=$(cat <<EOF
 {
   "kv_connector": "MoRIIOConnector",
   "kv_role": "${KV_ROLE}",
@@ -371,16 +379,21 @@ build_ep_cmd() {
     "http_port": "${port}",
     "local_ping_port": "${LOCAL_PING_PORT}",
     "handshake_port": "${HANDSHAKE_PORT}",
-    "notify_port": "${NOTIFY_PORT}"${read_mode_kv}
+    "notify_port": "${NOTIFY_PORT}",
+    "remote_hosts": [${peer_hosts%,}],
+    "remote_dp_size_local": ${GPUS_PER_NODE}${read_mode_kv}
   }
 }
 EOF
 )
+    if [[ "${IS_MASTER}" == "1" ]]; then
+        CMD+=(--api-server-count="${GPUS_PER_NODE}")
         if [[ "${KV_CONNECTOR:-}" == Nixl* ]]; then kv_cfg="$(nixl_kv_cfg)"; fi
         CMD+=(--kv-transfer-config "${kv_cfg}")
         log "role=${ROLE} mode=ep MASTER node_rank=${NODE_RANK} dp_size=${DP_GROUP_SIZE} dp_addr=${DP_MASTER_ADDR} kv_role=${KV_ROLE} all2all=${backend} read_mode=${MORIIO_READ_MODE}"
     else
         CMD+=(--data-parallel-start-rank "${DP_START_RANK}" --headless)
+        [[ "${KV_CONNECTOR:-}" == Nixl* ]] || CMD+=(--kv-transfer-config "${kv_cfg}")
         log "role=${ROLE} mode=ep CHILD  node_rank=${NODE_RANK} dp_size=${DP_GROUP_SIZE} dp_start_rank=${DP_START_RANK} dp_addr=${DP_MASTER_ADDR} all2all=${backend}"
     fi
 }
