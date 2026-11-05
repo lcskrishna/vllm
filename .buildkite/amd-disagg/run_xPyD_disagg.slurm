@@ -477,6 +477,47 @@ run_node_container() {
         RUN_IMAGE="$ainic_tag"
     fi
 
+    # Apply the vLLM fixes in patches/ that the image does not ship yet, baked
+    # the same way and on top of any ionic swap. A patch the image already
+    # carries is skipped; SKIP_VLLM_PATCHES=1 serves the image as is.
+    if [ "${SKIP_VLLM_PATCHES:-0}" = "1" ]; then
+        echo "Rank $rank vllm patches: <skipped: SKIP_VLLM_PATCHES=1>"
+    elif compgen -G "$DISAGG_SCRIPTS_DIR/patches/*.patch" >/dev/null; then
+        if [ "$DRY_RUN" = "1" ]; then
+            echo "DRY_RUN: would apply vllm patches to $RUN_IMAGE: $(cd "$DISAGG_SCRIPTS_DIR/patches" && ls *.patch | paste -sd' ' -)"
+        else
+            local base_id patch_sum patch_tag patch_cont patch_rc
+            base_id=$(docker image inspect -f '{{.Id}}' "$RUN_IMAGE" 2>/dev/null | cut -d: -f2 | cut -c1-12)
+            # Keyed on the base image and the patch contents, so a new pull or an
+            # edited patch is never served from an older bake.
+            patch_sum=$(cat "$DISAGG_SCRIPTS_DIR"/patches/*.patch | sha256sum | cut -c1-12)
+            patch_tag="vllm-disagg-patched:${base_id:-unknown}-${patch_sum}"
+            if docker image inspect "$patch_tag" >/dev/null 2>&1; then
+                echo "Rank $rank vllm patches: reusing $patch_tag"
+            else
+                echo "Rank $rank vllm patches: building $patch_tag from $RUN_IMAGE"
+                patch_cont="vllm-patch-${SLURM_JOB_ID:-0}-${rank}"
+                docker stop -t 30 "$patch_cont" >/dev/null 2>&1 || true
+                docker rm "$patch_cont" >/dev/null 2>&1 || true
+                if docker run --name "$patch_cont" --user 0:0 \
+                        -v "$DISAGG_SCRIPTS_DIR":"$CONTAINER_SCRIPTS":ro \
+                        --entrypoint /bin/bash "$RUN_IMAGE" \
+                        -c "bash $CONTAINER_SCRIPTS/apply_vllm_patches.sh $CONTAINER_SCRIPTS/patches" \
+                   && docker commit "$patch_cont" "$patch_tag" >/dev/null; then
+                    echo "Rank $rank vllm patches: committed $patch_tag"
+                    patch_rc=0
+                else
+                    echo "ERROR: rank $rank vllm patches failed on $(hostname)" >&2
+                    patch_rc=1
+                fi
+                docker stop -t 30 "$patch_cont" >/dev/null 2>&1 || true
+                docker rm "$patch_cont" >/dev/null 2>&1 || true
+                [ "$patch_rc" = "0" ] || return 1
+            fi
+            RUN_IMAGE="$patch_tag"
+        fi
+    fi
+
     # Start the external vLLM router as a SEPARATE container on the rank-0 node.
     if [ "$ROUTER_TYPE" = "vllm-router" ] && [ "$rank" = "0" ] && [ "$DRY_RUN" = "1" ]; then
         echo "DRY_RUN: would start vllm-router on $(hostname): $VLLM_ROUTER_IMAGE (discovery :$PROXY_PING_PORT, port :$ROUTER_PORT, policy $ROUTER_POLICY, dp_local=$ROUTER_DP_LOCAL)"

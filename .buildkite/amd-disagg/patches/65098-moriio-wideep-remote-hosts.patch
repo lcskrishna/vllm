@@ -1,0 +1,51 @@
+vllm-project/vllm#65098, the MoRIIO connector half: fill remote_hosts and
+remote_dp_size_local from the serve config when the router omits them.
+Applied to the run image by apply_vllm_patches.sh; delete once the nightly has it.
+
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
+index dadd550623..ff5f0e075e 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
+@@ -256,6 +256,20 @@ def pod_index(global_dp_rank: int, dp_size_local: int) -> int:
+     return global_dp_rank // dp_size_local if dp_size_local else 0
+ 
+ 
++def fill_remote_pod_from_config(
++    params: dict[str, Any], extra_config: dict, is_producer: bool
++) -> None:
++    """Use serve-config peer hosts when the router did not send them."""
++    hosts = extra_config.get("remote_hosts")
++    dp_local = int(extra_config.get("remote_dp_size_local") or 0)
++    if not hosts or not dp_local or params.get("remote_hosts"):
++        return
++    params["remote_hosts"] = hosts
++    params["remote_dp_size_local"] = dp_local
++    if not is_producer:
++        params.setdefault("is_request_leader", True)
++
++
+ def resolve_host_ip(extra_config: dict) -> str:
+     """The IP this MoRIIO process advertises for KV transfer.
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+index 4bd75ace0d..e5c85bb94b 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py
+@@ -47,6 +47,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+     TransferError,
+     TransferId,
+     WriteTask,
++    fill_remote_pod_from_config,
+     fold_local_rank,
+     get_moriio_mode,
+     get_peer_zmq_from_request_id,
+@@ -1055,6 +1056,9 @@ class MoRIIOConnectorScheduler:
+         # without a sidecar wire-protocol change.
+         transfer_id = params.get("transfer_id") or f"sidecar-{request.request_id}"
+         params.setdefault("transfer_id", transfer_id)
++        fill_remote_pod_from_config(
++            params, self.kv_transfer_config.kv_connector_extra_config, self.is_producer
++        )
+         request_id = request.request_id
+         self.map_request_id(request_id, transfer_id)
+         if params.get("do_remote_decode") and self.mode == MoRIIOMode.WRITE:

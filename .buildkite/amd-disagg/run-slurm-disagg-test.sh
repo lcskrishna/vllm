@@ -20,6 +20,7 @@
 #   bash run-slurm-disagg-test.sh                       # 1P1D TP8
 #   WIDE_EP_MODE=1 bash run-slurm-disagg-test.sh         # 1P1D wide-EP
 #   NODES=4 WIDE_EP_MODE=1 xP=2 yD=2 bash run-slurm-disagg-test.sh   # 2P2D EP
+#   SKIP_VLLM_PATCHES=1 bash run-slurm-disagg-test.sh    # serve the image without patches/
 # Prints the job id + NFS log paths and returns immediately (does NOT poll
 # squeue/sacct, which hang on Spur). Track the run via the printed `tail -f`.
 #
@@ -76,6 +77,8 @@ export ROUTER_TYPE ROUTER_PORT VLLM_ROUTER_IMAGE
 export SKIP_IONIC_MOUNTS
 # Bake a different repo.radeon.com ionic userspace channel into the run image.
 export AINIC_SWAP_CHANNEL
+# Serve the image without the vLLM fixes in patches/, e.g. once the nightly has them.
+export SKIP_VLLM_PATCHES
 
 # Model selection.
 [[ -n "${MODEL_NAME:-}" ]] && export MODEL_NAME
