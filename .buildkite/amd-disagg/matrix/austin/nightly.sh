@@ -1,15 +1,16 @@
 #!/bin/bash
-# nightly.sh [--scheduled] [drive.py options]: one run of the disagg gsm8k matrix
-# from the Austin node. cron starts it with --scheduled (see install-cron.sh).
+# nightly.sh [--scheduled] [drive.py options]: one run of the disagg matrix, gsm8k
+# accuracy and then the benchmarks, from the Austin node. cron starts it with
+# --scheduled (see install-cron.sh).
 #
 # Updates the clone in $MX_WORK/vllm to the latest csrikris-crusoe, copies its
 # tracked .buildkite/amd-disagg files to experiment-logs/<run> on Crusoe and runs
-# drive.py against that copy. drive.log, state, summary.md and the job logs go to
-# $MX_WORK/runs/<run>, and runs/latest points there. <run> is the IST date for a
-# --scheduled run and <date>-<HHMM> otherwise. drive.py options (--models,
-# --layouts, --cells, --image, --router-image, --ep-gate) pass through; its MX_*
-# settings can be overridden from the environment. Nothing is deleted, here or
-# on Crusoe.
+# drive.py against that copy. drive.log, state, summary.md, bench.tsv and the job
+# logs go to $MX_WORK/runs/<run>, and runs/latest points there. <run> is the IST
+# date for a --scheduled run and <date>-<HHMM> otherwise. drive.py options
+# (--models, --layouts, --cells, --no-bench, --image, --router-image, --ep-gate)
+# pass through; its MX_* settings can be overridden from the environment.
+# Nothing is deleted, here or on Crusoe.
 set -euo pipefail
 export PATH=/usr/local/bin:/usr/bin:/bin
 
@@ -75,9 +76,9 @@ main() {
     export MX_HOST="${host}" MX_SSH_KEY="${key}" MX_REMOTE_DIR="${remote}" MX_STATE_DIR="${runs}/${run}"
     export MX_COMMIT="${sha} on ${branch}"
     say "run ${run}: $(wc -l <<< "${cells}") cells; driver log ${runs}/${run}/drive.log"
-    # The 8 h limit keeps a hung driver from running into the next night. On
-    # TERM the driver cancels its jobs in flight and writes summary.md.
-    timeout -k 10m -s TERM "${MX_TIMEOUT:-8h}" python3 "${mx}/drive.py" "$@" >> "${runs}/${run}/drive.log" 2>&1 &
+    # The 23 h limit ends a 01:37 run before the next one starts. On TERM the
+    # driver cancels its jobs in flight and writes summary.md.
+    timeout -k 10m -s TERM "${MX_TIMEOUT:-23h}" python3 "${mx}/drive.py" "$@" >> "${runs}/${run}/drive.log" 2>&1 &
     local pid=$! rc
     trap 'kill -TERM "${pid}" 2>/dev/null || true' TERM INT HUP
     while true; do

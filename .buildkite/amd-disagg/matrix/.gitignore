@@ -1,6 +1,7 @@
 state.json
 state.json.tmp
 results.tsv
+bench.tsv
 summary.md
 summary.md.tmp
 logs/

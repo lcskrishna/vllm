@@ -11,4 +11,4 @@ for f in "$d"/prefill_*.log "$d"/decode_*.log "$d"/vllm_router.log; do
     echo "-- tail:"; tail -n 2 "$f" | cut -c1-320
 done
 echo "== job log"
-grep -aE 'healthy|waiting on|PASS|FAIL|TIMEOUT|exited|ERROR' "$L/vllm-disagg-pd-$j.log" | tail -n 8 | cut -c1-320
+grep -aE 'healthy|waiting on|PASS|FAIL|TIMEOUT|exited|ERROR|\] bench ' "$L/vllm-disagg-pd-$j.log" | tail -n 8 | cut -c1-320

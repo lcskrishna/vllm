@@ -543,9 +543,12 @@ run_node_container() {
         mkdir -p "$LOG_PATH" 2>/dev/null || true
         {
             echo "Starting vllm-router on $(hostname): $VLLM_ROUTER_IMAGE (discovery :$PROXY_PING_PORT, port :$ROUTER_PORT, policy $ROUTER_POLICY, dp_local=$ROUTER_DP_LOCAL)"
+            # Each request holds a client socket plus one to prefill and one to
+            # decode; at the default limit of 1024 files, concurrency 512 fails.
             docker run -d \
                 --name "$ROUTER_CONT_NAME" \
                 --network host \
+                --ulimit nofile=1048576:1048576 \
                 --user "$(id -u):$(id -g)" \
                 -v "$LOG_PATH":/run_logs \
                 -v "$SHARED_MOUNT":"$SHARED_MOUNT" \
@@ -598,6 +601,8 @@ run_node_container() {
         -e ACCURACY_NUM_CONCURRENT -e TP_SIZE -e DP_SIZE -e EP_SIZE \
         -e CLUSTER_ENV="$CLUSTER_ENV" \
         -e CLUSTER_SERVE_FLAGS -e MORI_IB_PATH_MTU -e ACCURACY_LOG_SAMPLES \
+        -e BENCHMARK_COMBINATIONS -e BENCHMARK_CON -e NUM_PROMPTS_FACTOR -e BENCHMARK_MIN_PROMPTS \
+        -e MORIIO_DEFER_TIMEOUT \
         -e MODEL_NAME="${MODEL_NAME:-}" \
         -e MODEL_DIR="${MODEL_DIR:-}" \
         -e SHARED_MOUNT="$SHARED_MOUNT" \

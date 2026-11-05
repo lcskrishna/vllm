@@ -7,9 +7,12 @@
 # MORI_IB_PATH_MTU, DRY_RUN=1, ACCURACY_LOG_SAMPLES=0 (matrix runs keep the
 # gsm8k samples by default), VLLM_PATCHES (EP layouts default to the
 # vllm-project/vllm#65098 MoRIIO patch; set it empty to serve the plain image),
-# IMAGE / VLLM_ROUTER_IMAGE (default: the launcher's nightly tags), and any
-# crusoe.env setting. MX_ID names the run in jobs.log, so a driver that lost the
-# ssh session mid-submit can still find the job.
+# IMAGE / VLLM_ROUTER_IMAGE (default: the launcher's nightly tags),
+# RUN_AFTER_HEALTH=bench with BENCHMARK_COMBINATIONS, BENCHMARK_CON,
+# NUM_PROMPTS_FACTOR, BENCHMARK_MIN_PROMPTS, MORIIO_DEFER_TIMEOUT and
+# SLURM_TIME_LIMIT for a benchmark job, and any crusoe.env setting. MX_ID names
+# the run in jobs.log, so a driver that lost the ssh session mid-submit can
+# still find the job.
 set -euo pipefail
 [[ $# -eq 1 ]] || { echo "usage: MODEL_NAME=... MODEL_DIR=... $0 <1p1d-tp8|2p1d-tp8|1p1d-ep|2p1d-ep|1p2d-ep>" >&2; exit 2; }
 : "${MODEL_NAME:?set MODEL_NAME}" "${MODEL_DIR:?set MODEL_DIR}"

@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Drive the disagg gsm8k model matrix on Crusoe Spur.
+"""Drive the disagg gsm8k model matrix and its benchmarks on Crusoe Spur.
 
     drive.py [--models dsv4,glm] [--layouts 1p1d-tp8,2p1d-ep] [--cells glm_2p1d-ep]
-             [--image REF] [--router-image REF] [--ep-gate] [--list]
+             [--no-bench] [--image REF] [--router-image REF] [--ep-gate] [--list]
 
 matrix/austin/nightly.sh runs it every night from the Austin node, after copying
 .buildkite/amd-disagg to the run's folder on Crusoe (MX_REMOTE_DIR). State,
-results.tsv, summary.md and the job logs go to MX_STATE_DIR on this host, so a
-restart with the same MX_STATE_DIR picks up where it stopped.
+results.tsv, bench.tsv, summary.md and the job logs go to MX_STATE_DIR on this
+host, so a restart with the same MX_STATE_DIR picks up where it stopped.
+
+Each model x layout has a gsm8k accuracy cell (glm_2p1d-ep) and a benchmark
+cell (glm_2p1d-ep_bench), which runs `vllm bench serve` at each MX_BENCH_CON
+level. Benchmarks start once no accuracy cell is left to run, and only for
+cells whose accuracy passed; a benchmark selected without its accuracy cell
+runs regardless. The benchmarks that the other runs next to MX_STATE_DIR ran
+least recently go first.
 
 Every POLL_S seconds, one session on the login node checks the jobs in flight
 and counts the nodes of all the user's Spur jobs, running or pending. A cell
@@ -16,13 +23,14 @@ cell starts after MX_NO_NEW_AFTER. Every cell runs the same vLLM and vllm-router
 images: the nightly tags, resolved to digests when the run starts.
 
 A failed cell is retried once on its own (out-of-memory with a smaller KV cap),
-except the expected failures in MX_XFAIL. A preflight rejection (dirty node) is
-resubmitted without counting as a retry. A job whose gsm8k makes no progress
-for STALL_S is cancelled and fails as class "stall". With --ep-gate the EP
-pilot runs first among the EP cells and the others start only once it passes;
-a pilot that fails twice blocks them. SIGTERM, SIGINT or SIGHUP cancels the
-jobs in flight. The exit code is 0 only if every cell passed or failed as
-expected.
+except the expected failures in MX_XFAIL and benchmarks that got through at
+least one level. A preflight rejection (dirty node) is resubmitted without
+counting as a retry. A job whose gsm8k or benchmark makes no progress for
+STALL_S is cancelled and fails as class "stall". With --ep-gate the EP pilot
+runs first among the EP cells and the others start only once it passes; a
+pilot that fails twice blocks them. SIGTERM, SIGINT or SIGHUP cancels the jobs
+in flight. The exit code is 0 only if every cell passed or failed as expected;
+a benchmark skipped because its accuracy failed doesn't count on its own.
 
 Environment:
   MX_REMOTE_DIR    the run's folder on Crusoe, holding .buildkite/amd-disagg (required)
@@ -33,8 +41,14 @@ Environment:
   MX_SSH_KEY       identity file for ssh and rsync (default: ssh's own choice)
   MX_LOG_ROOT      job logs on Crusoe (default: /shared_nfs/<user>/logs)
   MX_MAX_NODES     node budget across all the user's Spur jobs (default: 3)
-  MX_NO_NEW_AFTER  HH:MM IST after which no cell starts (default: 09:00; empty: none)
+  MX_NO_NEW_AFTER  HH:MM IST after which no cell starts (default: 23:00; empty: none)
   MX_XFAIL         expected-fail cells, comma-separated (default: glm_2p1d-ep)
+  MX_BENCH_ISL_OSL     benchmark input/output lengths, space-separated (default: 8192/1024)
+  MX_BENCH_CON         benchmark concurrency levels (default: 8 16 32 64)
+  MX_BENCH_PROMPTS     prompts per level, times its concurrency, at least 32 (default: 2)
+  MX_BENCH_TIME_LIMIT  walltime of a benchmark job (default: 02:00:00)
+  MX_BENCH_DEFER_TIMEOUT  seconds a benchmark's prefill waits for decode KV blocks
+                       before MoRIIO fails the request (default: 600; empty: MoRIIO's 60)
   MX_COMMIT        the code version to report (default: this checkout's HEAD)
   POLL_S           seconds between polls (default: 120)
 
@@ -47,6 +61,7 @@ Commands go in MX_STATE_DIR/control.txt, one per line, consumed on the next loop
 import argparse
 import base64
 import getpass
+import glob
 import json
 import os
 import re
@@ -70,6 +85,7 @@ STATE_DIR = os.environ.get("MX_STATE_DIR") or HERE
 STATE = os.path.join(STATE_DIR, "state.json")
 CONTROL = os.path.join(STATE_DIR, "control.txt")
 RESULTS = os.path.join(STATE_DIR, "results.tsv")
+BENCH_TSV = os.path.join(STATE_DIR, "bench.tsv")
 SUMMARY = os.path.join(STATE_DIR, "summary.md")
 LOCK = os.path.join(STATE_DIR, "driver.lock")
 LOGS = os.path.join(STATE_DIR, "logs")
@@ -78,13 +94,21 @@ COMMIT = os.environ.get("MX_COMMIT", "")
 ME = f"{socket.gethostname()}:{os.getpid()}"
 POLL_S = int(os.environ.get("POLL_S", "120"))
 MAX_NODES = int(os.environ.get("MX_MAX_NODES", "3"))
-NO_NEW_AFTER = os.environ.get("MX_NO_NEW_AFTER", "09:00")
+NO_NEW_AFTER = os.environ.get("MX_NO_NEW_AFTER", "23:00")
 XFAIL = {c for c in os.environ.get("MX_XFAIL", "glm_2p1d-ep").split(",") if c}
+BENCH = {"isl_osl": os.environ.get("MX_BENCH_ISL_OSL", "8192/1024"),
+         "con": os.environ.get("MX_BENCH_CON", "8 16 32 64"),
+         "prompts": os.environ.get("MX_BENCH_PROMPTS", "2"),
+         "time_limit": os.environ.get("MX_BENCH_TIME_LIMIT", "02:00:00"),
+         "defer_timeout": os.environ.get("MX_BENCH_DEFER_TIMEOUT", "600")}
+BENCH_MIN_PROMPTS = 32
+GPUS_PER_NODE = 8
 EP_GATE = False
 OOM_RETRY_KV_GIB = 24
 MAX_PREFLIGHT_RESUBMITS = 2
-# gsm8k completes requests every few seconds even on the slowest layout, so this
-# long without progress is a hang (e.g. an EP collective that never returns).
+# gsm8k and vllm bench serve complete requests every few seconds even on the
+# slowest layout, so this long without progress is a hang (e.g. an EP
+# collective that never returns).
 STALL_S = 1200
 IST = timezone(timedelta(hours=5, minutes=30))
 IMAGES = {"vllm": "vllm/vllm-openai-rocm:nightly", "router": "vllm/vllm-router:nightly"}
@@ -108,6 +132,8 @@ EP_ORDER = [
     "glm_1p1d-ep", "glm_2p1d-ep", "glm_1p2d-ep",
     "dsv4_1p1d-ep", "dsv4_2p1d-ep", "dsv4_1p2d-ep",
 ]
+ACC_ORDER = TP_ORDER + EP_ORDER
+BENCH_ORDER = [f"{c}_bench" for c in ACC_ORDER]
 ACTIVE = ("RUNNING", "COMPLETING", "PENDING", "CONFIGURING", "REQUEUED")
 TSV_COLS = ["id", "model", "layout", "attempt", "job", "verdict", "score", "nodes",
             "image", "vllm", "kv_gib", "mtu", "class", "note"]
@@ -124,27 +150,34 @@ def say(msg):
     print(f"{datetime.now(IST):%H:%M:%S} {msg}", flush=True)
 
 
-def select_cells(models=None, layouts=None, cells=None):
-    """The cells that match every given filter, in TP_ORDER + EP_ORDER order."""
-    every = TP_ORDER + EP_ORDER
+def acc_id(rid):
+    """The accuracy cell a benchmark cell belongs to; an accuracy cell's own id."""
+    return rid.removesuffix("_bench")
+
+
+def select_cells(models=None, layouts=None, cells=None, bench=True):
+    """The cells that match every given filter: accuracy cells in ACC_ORDER, then benchmarks."""
+    every = ACC_ORDER + BENCH_ORDER
     for kind, given, known in (("model", models, MODELS), ("layout", layouts, LAYOUTS), ("cell", cells, every)):
         bad = [x for x in given or [] if x not in known]
         if bad:
             raise SystemExit(f"unknown {kind}: {', '.join(bad)} (known: {', '.join(known)})")
     return [c for c in every
-            if (not models or c.split("_", 1)[0] in models)
-            and (not layouts or c.split("_", 1)[1] in layouts)
-            and (not cells or c in cells)]
+            if (not models or acc_id(c).split("_", 1)[0] in models)
+            and (not layouts or acc_id(c).split("_", 1)[1] in layouts)
+            and (not cells or c in cells)
+            and (bench or c in ACC_ORDER)]
 
 
 def new_state(cells=None):
     runs = {}
-    for rid in cells or TP_ORDER + EP_ORDER:
-        model, layout = rid.split("_", 1)
+    for rid in cells or ACC_ORDER + BENCH_ORDER:
+        model, layout = acc_id(rid).split("_", 1)
         runs[rid] = {"model": model, "layout": layout, "kind": "ep" if layout.endswith("-ep") else "tp",
+                     "workload": "accuracy" if rid in ACC_ORDER else "bench",
                      "status": "queued", "next": {}, "attempts": [], "preflight_resubmits": 0}
     return {"runs": runs, "ep_gate": "pilot" if EP_GATE and PILOT in runs else "open", "paused": False,
-            "images": dict(IMAGES)}
+            "images": dict(IMAGES), "bench": dict(BENCH)}
 
 
 def load(cells=None):
@@ -152,9 +185,11 @@ def load(cells=None):
     if os.path.exists(STATE):
         with open(STATE) as f:
             saved = json.load(f)
-        # Cells added to TP_ORDER/EP_ORDER after the state was written join as queued.
+        # Cells added to ACC_ORDER/BENCH_ORDER after the state was written join as queued.
         for rid, r in st["runs"].items():
             saved["runs"].setdefault(rid, r)
+        for rid, r in saved["runs"].items():
+            r.setdefault("workload", "accuracy" if rid in ACC_ORDER else "bench")
         for k, v in st.items():
             saved.setdefault(k, v)
         st = saved
@@ -167,7 +202,7 @@ def save(st):
         json.dump(st, f, indent=1)
     os.replace(tmp, STATE)
     rows = ["\t".join(TSV_COLS)]
-    for rid in TP_ORDER + EP_ORDER:
+    for rid in ACC_ORDER + BENCH_ORDER:
         r = st["runs"].get(rid)
         for i, a in enumerate(r["attempts"] if r else [], 1):
             rows.append("\t".join(str(x) for x in [
@@ -228,7 +263,7 @@ def ssh(body, timeout=300):
 
 def push_results_cmd():
     cmd = ""
-    for path in (RESULTS, SUMMARY):
+    for path in (RESULTS, BENCH_TSV, SUMMARY):
         if os.path.exists(path):
             with open(path, "rb") as f:
                 b64 = base64.encodebytes(f.read()).decode()
@@ -279,6 +314,24 @@ def git_head():
     return p.stdout.strip() or "-"
 
 
+def last_benched():
+    """{benchmark cell: when it last started} over the other runs next to STATE_DIR."""
+    here, seen = os.path.realpath(STATE_DIR), {}
+    for path in glob.glob(os.path.join(os.path.dirname(here), "*", "state.json")):
+        if os.path.realpath(os.path.dirname(path)) == here:
+            continue
+        try:
+            with open(path) as f:
+                runs = json.load(f)["runs"]
+            for rid in set(runs) & set(BENCH_ORDER):
+                for a in runs[rid]["attempts"]:
+                    if a.get("class") != "cancelled":
+                        seen[rid] = max(seen.get(rid, 0), a.get("submitted") or 0)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return seen
+
+
 def inflight(st):
     return [rid for rid, r in st["runs"].items() if r["status"] in ("submitting", "inflight")]
 
@@ -307,6 +360,11 @@ def classify_finish(st, rid, a):
     if rid in XFAIL:
         r["status"] = "done"
         say(f"XFAIL {rid}: failed as expected ({cls}); not retrying")
+        return
+    if r["workload"] == "bench" and a.get("levels", "0") not in ("0", "-"):
+        # Load-dependent: a second sweep would most likely fail the same way.
+        r["status"] = "done"
+        say(f"BENCH FAILED {rid}: {cls} after {a['levels']} level(s) wrote results; not retrying")
         return
     retries = sum(1 for x in r["attempts"] if x.get("class") not in ("preflight", "cancelled")) - 1
     if retries < 1:
@@ -393,12 +451,15 @@ def poll(st):
         if not f:
             continue
         a.update({k: f.get(k, "-") for k in ("nodes", "image", "vllm")})
+        if r["workload"] == "bench":
+            a["levels"] = f.get("levels", "-")
         state, rc, gate = f.get("state", "-"), f.get("rc", "-"), f.get("gate", "-")
         if state in ACTIVE and rc == "-":
             a["gone_polls"] = 0
             idle = f.get("idle", "-")
             if gate == "-" and idle.isdigit() and int(idle) > STALL_S and not a.get("stalled"):
-                a["stalled"] = f"no gsm8k progress for {int(idle) // 60} min; cancelled by the driver"
+                what = "benchmark" if r["workload"] == "bench" else "gsm8k"
+                a["stalled"] = f"no {what} progress for {int(idle) // 60} min; cancelled by the driver"
                 ssh(f"scancel {a['job']}", timeout=60)
                 say(f"STALLED {rid} job={a['job']}: {a['stalled']}")
             if a.get("seen_state") != state:
@@ -427,13 +488,48 @@ def poll(st):
     return held_nodes(st, out)
 
 
+def acc_passed(st, rid):
+    """Whether benchmark cell rid may run: its accuracy cell passed, or isn't in this run."""
+    r = st["runs"].get(acc_id(rid))
+    return r is None or (r["status"] == "done" and bool(r["attempts"])
+                         and r["attempts"][-1].get("verdict") == "PASS")
+
+
+def acc_failed(st, rid):
+    """Whether benchmark cell rid never will: its accuracy cell is done without passing."""
+    r = st["runs"].get(acc_id(rid))
+    return r is not None and r["status"] == "done" and not acc_passed(st, rid)
+
+
 def pick(st, free):
     """The next queued cell that fits in `free` nodes, or None."""
-    runs = st["runs"]
-    if st["paused"]:
+    return None if st["paused"] else next_cell(st, free)
+
+
+def next_cell(st, free):
+    """pick() regardless of a pause. Benchmarks wait until no accuracy cell is
+    in flight or could start, and go in st["bench_order"]."""
+    if past_cutoff(st):
         return None
+    rid = acc_pick(st, free)
+    if rid:
+        return rid
+    runs = st["runs"]
+    if any(r["workload"] == "accuracy" for r in (runs[i] for i in inflight(st))) or acc_pick(st, MAX_NODES):
+        return None
+    order = st.get("bench_order") or []
+    for rid in order + [c for c in BENCH_ORDER if c not in order]:
+        r = runs.get(rid)
+        if r and r["status"] == "queued" and acc_passed(st, rid) and LAYOUTS[r["layout"]] <= free:
+            return rid
+    return None
+
+
+def acc_pick(st, free):
+    """The next queued accuracy cell that fits in `free` nodes, or None."""
+    runs = st["runs"]
     fl = inflight(st)
-    ep_inflight = any(runs[i]["kind"] == "ep" for i in fl)
+    ep_inflight = any(runs[i]["kind"] == "ep" and runs[i]["workload"] == "accuracy" for i in fl)
 
     def fits(ids):
         return [i for i in ids if i in runs and runs[i]["status"] == "queued" and LAYOUTS[runs[i]["layout"]] <= free]
@@ -478,6 +574,11 @@ def start_cells(st, held):
 def submit(st, rid):
     r = st["runs"][rid]
     nxt = r.get("next") or {}
+    if r["workload"] == "bench" and not r["attempts"] and not nxt:
+        # Serve the way the accuracy cell last ran, e.g. with its out-of-memory KV cap.
+        acc = st["runs"].get(acc_id(rid))
+        last = acc["attempts"][-1] if acc and acc["attempts"] else {}
+        nxt = {k: last[k] for k in ("kv", "mtu") if last.get(k)}
     a = {"submitted": time.time(), "kv": nxt.get("kv"), "mtu": nxt.get("mtu")}
     r["attempts"].append(a)
     r["status"], r["next"] = "submitting", {}
@@ -486,6 +587,13 @@ def submit(st, rid):
     env = {"MX_ID": rid, "MODEL_NAME": name, "MODEL_DIR": model_dir, "IMAGE": st["images"]["vllm"],
            "VLLM_ROUTER_IMAGE": st["images"]["router"], "DISAGG_SCRIPTS_STAGE": f"{REMOTE_ROOT}/stage",
            "LOG_ROOT": LOG_ROOT}
+    if r["workload"] == "bench":
+        b = st["bench"]
+        env.update({"RUN_AFTER_HEALTH": "bench", "BENCHMARK_COMBINATIONS": b["isl_osl"],
+                    "BENCHMARK_CON": b["con"], "NUM_PROMPTS_FACTOR": b["prompts"],
+                    "BENCHMARK_MIN_PROMPTS": str(BENCH_MIN_PROMPTS), "SLURM_TIME_LIMIT": b["time_limit"]})
+        if b.get("defer_timeout"):
+            env["MORIIO_DEFER_TIMEOUT"] = b["defer_timeout"]
     if a["kv"]:
         env["KV_GIB"] = str(a["kv"])
     if a["mtu"]:
@@ -579,21 +687,38 @@ def past_cutoff(st):
 
 
 def finished(st):
-    """Nothing in flight, and nothing more will start."""
-    if inflight(st):
-        return False
-    return past_cutoff(st) or (not st["paused"] and pick(st, MAX_NODES) is None)
+    """Nothing in flight, and nothing more will start, even once a pause ends."""
+    return not inflight(st) and next_cell(st, MAX_NODES) is None
 
 
 def tally(st):
-    c = {"pass": 0, "fail": 0, "xfail": 0, "queued": 0, "active": 0}
+    """Counts per workload, "accuracy" and "bench"."""
+    c = {w: {"cells": 0, "pass": 0, "fail": 0, "xfail": 0, "skipped": 0, "queued": 0, "active": 0}
+         for w in ("accuracy", "bench")}
     for rid, r in st["runs"].items():
+        t = c[r["workload"]]
+        t["cells"] += 1
         a = r["attempts"][-1] if r["attempts"] else {}
         if r["status"] == "done":
-            c["pass" if a.get("verdict") == "PASS" else "xfail" if rid in XFAIL else "fail"] += 1
+            t["pass" if a.get("verdict") == "PASS" else "xfail" if rid in XFAIL else "fail"] += 1
+        elif r["status"] == "queued" and acc_failed(st, rid):
+            t["skipped"] += 1
         else:
-            c["queued" if r["status"] == "queued" else "active"] += 1
+            t["queued" if r["status"] == "queued" else "active"] += 1
     return c
+
+
+def tally_text(t, final, workload):
+    """One workload's counts, for summary.md and the log."""
+    parts = [f"{t['pass']} of {t['cells']} cells passed" if final else f"{t['pass']} passed", f"{t['fail']} failed"]
+    if workload == "accuracy" or t["xfail"]:
+        parts.append(f"{t['xfail']} failed as expected")
+    if t["skipped"]:
+        parts.append(f"{t['skipped']} skipped because the accuracy cell didn't pass")
+    if not final:
+        parts.append(f"{t['active']} running")
+    parts.append(f"{t['queued']} not run" if final else f"{t['queued']} to go")
+    return ", ".join(parts)
 
 
 def ist(ts, fmt="%H:%M"):
@@ -613,43 +738,163 @@ def cell_text(st, rid, final):
         return ""
     a = r["attempts"][-1] if r["attempts"] else {}
     tries = f" ({len(r['attempts'])} tries)" if len(r["attempts"]) > 1 else ""
+    # A benchmark's score is its levels, e.g. 8/8.
+    levels = f" {a['score']}" if r["workload"] == "bench" and a.get("score") not in (None, "-") else ""
     if r["status"] == "done":
         if a.get("verdict") == "PASS":
+            if levels:
+                return f"PASS{levels}{tries}"
             try:
                 return f"PASS {float(a.get('score')):.4f}{tries}"
             except (TypeError, ValueError):
                 return f"PASS{tries}"
-        return f"{'XFAIL' if rid in XFAIL else 'FAIL'} ({a.get('class') or '-'}){tries}"
+        return f"{'XFAIL' if rid in XFAIL else 'FAIL'}{levels} ({a.get('class') or '-'}){tries}"
     if r["status"] in ("inflight", "ended"):
         return f"running, job {a.get('job')}"
     if r["status"] == "submitting":
         return "submitting"
     if a.get("class") == "cancelled":
         return "cancelled"
+    if acc_failed(st, rid):
+        return "skipped"
     return "not run" if final else ("retry queued" if r["attempts"] else "queued")
 
 
+def cell_name(r):
+    return f"{MODELS[r['model']][0]} {r['layout'].upper().replace('-', ' ')}"
+
+
+def num(v, digits, div=1):
+    """v / div with `digits` decimals; "-" if v isn't a number."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return "-"
+    return f"{v / div:.{digits}f}"
+
+
+def bench_levels(st):
+    """The (isl, osl, concurrency) levels of the run's benchmarks, in the order they run."""
+    b = st["bench"]
+    return [(int(io.split("/")[0]), int(io.split("/")[1]), int(con))
+            for io in b["isl_osl"].split() for con in b["con"].split()]
+
+
+def level_ok(x):
+    return x.get("completed") == x.get("num_prompts") and not x.get("failed")
+
+
+def bench_results(job):
+    """{(isl, osl, concurrency): vllm bench serve result} of a job, from its logs copied to LOGS."""
+    res = {}
+    for path in glob.glob(os.path.join(LOGS, str(job), "bench_*", "bench_*_con*.json")):
+        m = re.search(r"bench_(\d+)_(\d+)_con(\d+)\.json$", path)
+        try:
+            with open(path) as f:
+                x = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if m and isinstance(x, dict):
+            res[tuple(int(g) for g in m.groups())] = x
+    return res
+
+
+def bench_done(st):
+    """(id, run, attempt) of each benchmark cell whose newest job has ended, in table order."""
+    out = []
+    for m in MODELS:
+        for k in LAYOUTS:
+            r = st["runs"].get(f"{m}_{k}_bench")
+            a = next((a for a in reversed(r["attempts"]) if a.get("job")), None) if r else None
+            if a and a.get("ended"):
+                out.append((f"{m}_{k}_bench", r, a))
+    return out
+
+
+def bench_tables(st, done, results):
+    """Output tokens/s per GPU of every finished benchmark, then each one's levels."""
+    levels = bench_levels(st)
+    multi = len({lv[:2] for lv in levels}) > 1
+
+    def label(lv):
+        return f"{lv[0]}/{lv[1]} @ {lv[2]}" if multi else str(lv[2])
+    def per_gpu(x, gpus):
+        v = num(x.get("output_throughput"), 1, gpus)
+        return v if level_ok(x) else f"{v} ({x.get('failed') or 0} failed)"
+    out = ["Output tokens/s per GPU at each concurrency (N failed: that many requests failed; -: didn't run):", "",
+           "| Cell | GPUs | " + " | ".join(label(lv) for lv in levels) + " |",
+           "|---|---|" + "---|" * len(levels)]
+    for rid, r, a in done:
+        gpus = LAYOUTS[r["layout"]] * GPUS_PER_NODE
+        row = [per_gpu(results[rid][lv], gpus) if lv in results[rid] else "-" for lv in levels]
+        out.append(f"| {cell_name(r)} | {gpus} | " + " | ".join(row) + " |")
+    out.append("")
+    for rid, r, a in done:
+        gpus = LAYOUTS[r["layout"]] * GPUS_PER_NODE
+        out += [f"### {cell_name(r)}: job {a['job']} on {gpus} GPUs", "",
+                f"| {'Lengths @ concurrency' if multi else 'Concurrency'} | Requests | Output tok/s | "
+                "Output tok/s/GPU | Total tok/s | TTFT ms, median / P99 | TPOT ms, median / P99 | "
+                "ITL ms, median / P99 | E2EL s, median / P99 | Duration s |",
+                "|---|---|---|---|---|---|---|---|---|---|"]
+        for lv in levels:
+            x = results[rid].get(lv)
+            if x is None:
+                out.append(f"| {label(lv)} | not run |" + " - |" * 8)
+                continue
+            reqs = f"{x.get('completed')}/{x.get('num_prompts')}" + (f", {x['failed']} failed" if x.get("failed") else "")
+            out.append(f"| {label(lv)} | {reqs} | {num(x.get('output_throughput'), 1)} | "
+                       f"{num(x.get('output_throughput'), 1, gpus)} | {num(x.get('total_token_throughput'), 1)} | "
+                       f"{num(x.get('median_ttft_ms'), 0)} / {num(x.get('p99_ttft_ms'), 0)} | "
+                       f"{num(x.get('median_tpot_ms'), 1)} / {num(x.get('p99_tpot_ms'), 1)} | "
+                       f"{num(x.get('median_itl_ms'), 1)} / {num(x.get('p99_itl_ms'), 1)} | "
+                       f"{num(x.get('median_e2el_ms'), 1, 1000)} / {num(x.get('p99_e2el_ms'), 1, 1000)} | "
+                       f"{num(x.get('duration'), 0)} |")
+        out.append("")
+    return out
+
+
+BENCH_TSV_COLS = (["run", "id", "model", "layout", "gpus", "job", "vllm", "isl", "osl", "concurrency",
+                   "num_prompts", "completed", "failed", "duration", "request_throughput", "output_throughput",
+                   "output_throughput_per_gpu", "total_token_throughput"]
+                  + [f"{s}_{m}_ms" for m in ("ttft", "tpot", "itl", "e2el") for s in ("mean", "median", "p99")])
+
+
+def write_bench_tsv(done, results):
+    """bench.tsv: one row per level of every finished benchmark."""
+    run = os.path.basename(os.path.abspath(STATE_DIR))
+    rows = ["\t".join(BENCH_TSV_COLS)]
+    for rid, r, a in done:
+        gpus = LAYOUTS[r["layout"]] * GPUS_PER_NODE
+        for (isl, osl, con), x in sorted(results[rid].items()):
+            tput = x.get("output_throughput")
+            own = {"run": run, "id": rid, "model": MODELS[r["model"]][0], "layout": r["layout"], "gpus": gpus,
+                   "job": a["job"], "vllm": a.get("vllm") or "-", "isl": isl, "osl": osl, "concurrency": con,
+                   "output_throughput_per_gpu": tput / gpus if isinstance(tput, (int, float)) else "-"}
+            vals = (own[k] if k in own else x.get(k, "-") for k in BENCH_TSV_COLS)
+            rows.append("\t".join(f"{v:.3f}" if isinstance(v, float) else str(v) for v in vals))
+    with open(BENCH_TSV, "w") as f:
+        f.write("\n".join(rows) + "\n")
+
+
 def write_summary(st, final=False):
-    """summary.md: what ran on which images, a model x layout table and every attempt."""
+    """summary.md: what ran on which images, the accuracy and benchmark tables and
+    every attempt; and bench.tsv if the run has benchmarks."""
     c, now = tally(st), time.time()
     started = st.get("started", now)
     mins = int(now - started) // 60
     vllm = next((a["vllm"] for r in st["runs"].values() for a in r["attempts"]
                  if a.get("vllm") not in (None, "-")), "-")
-    out = [f"# Disagg gsm8k matrix, run {os.path.basename(os.path.abspath(STATE_DIR))}", ""]
+    out = [f"# Disagg matrix, run {os.path.basename(os.path.abspath(STATE_DIR))}", ""]
     if final:
-        out += [f"- Ran from {ist(started, '%Y-%m-%d %H:%M')} to {ist(now)} IST ({mins // 60} h {mins % 60} min).",
-                f"- Result: {c['pass']} of {len(st['runs'])} cells passed, {c['fail']} failed, "
-                f"{c['xfail']} failed as expected, {c['queued']} not run."]
+        out.append(f"- Ran from {ist(started, '%Y-%m-%d %H:%M')} to {ist(now)} IST ({mins // 60} h {mins % 60} min).")
     else:
         status = (f"stopped at {ist(st['stopped']['at'])} IST ({st['stopped']['why']})" if st.get("stopped")
                   else f"in progress, updated {ist(now)} IST")
-        out += [f"- Started {ist(started, '%Y-%m-%d %H:%M')} IST; {status}.",
-                f"- So far: {c['pass']} passed, {c['fail']} failed, {c['xfail']} failed as expected, "
-                f"{c['active']} running, {c['queued']} to go."]
+        out.append(f"- Started {ist(started, '%Y-%m-%d %H:%M')} IST; {status}.")
+    for w, title in (("accuracy", "Accuracy"), ("bench", "Benchmarks")):
+        if c[w]["cells"]:
+            out.append(f"- {title}{'' if final else ' so far'}: {tally_text(c[w], final, w)}.")
     if st.get("ep_gate") == "blocked":
         out.append(f"- EP gate blocked: the pilot `{PILOT}` failed twice, so EP cells that hadn't started didn't run.")
-    if c["queued"] and past_cutoff(st):
+    if (c["accuracy"]["queued"] or c["bench"]["queued"]) and past_cutoff(st):
         out.append(f"- No cell starts after {cutoff_text(st)}, so the cells that hadn't started by then didn't run.")
     out += [
         f"- Code: `{st.get('commit', '-')}`, staged to `{st.get('remote_root', REMOTE_ROOT)}` on Crusoe.",
@@ -658,32 +903,52 @@ def write_summary(st, final=False):
         f"- At most {MAX_NODES} nodes at a time across all of {SPUR_USER}'s Spur jobs"
         + (f"; no new cell after {cutoff_text(st)}." if st.get("cutoff") else "."),
         f"- Expected failures: {', '.join(sorted(XFAIL)) or 'none'}.",
-        f"- Job logs: `logs/` next to this file (without the gsm8k samples), and everything in `{LOG_ROOT}` on Crusoe.",
-        "",
     ]
-    models = [k for k in MODELS if any(r["model"] == k for r in st["runs"].values())]
-    layouts = [k for k in LAYOUTS if any(r["layout"] == k for r in st["runs"].values())]
-    out += ["| Model | " + " | ".join(k.upper().replace("-", " ") for k in layouts) + " |",
-            "|---|" + "---|" * len(layouts)]
-    for m in models:
-        out.append(f"| {MODELS[m][0]} | " + " | ".join(cell_text(st, f"{m}_{k}", final) for k in layouts) + " |")
+    if c["bench"]["cells"]:
+        b = st["bench"]
+        defer = (f"; MoRIIO lets a prefill wait {b['defer_timeout']} s for decode KV blocks" if b.get("defer_timeout")
+                 else "")
+        out.append(f"- Benchmark settings: `vllm bench serve` on random prompts of {b['isl_osl']} input/output tokens at "
+                   f"concurrency {b['con']}, with {b['prompts']} prompts per unit of concurrency (at least "
+                   f"{BENCH_MIN_PROMPTS}){defer}. They start after the accuracy cells, and only for cells whose "
+                   "accuracy passed.")
+    out += [f"- Job logs: `logs/` next to this file (without the gsm8k samples), and everything in `{LOG_ROOT}` on Crusoe.",
+            ""]
+    for w, title, suffix in (("accuracy", "## Accuracy: gsm8k exact_match", ""), ("bench", "## Benchmarks", "_bench")):
+        runs = [r for r in st["runs"].values() if r["workload"] == w]
+        if not runs:
+            continue
+        models = [k for k in MODELS if any(r["model"] == k for r in runs)]
+        layouts = [k for k in LAYOUTS if any(r["layout"] == k for r in runs)]
+        out += [title, "", "| Model | " + " | ".join(k.upper().replace("-", " ") for k in layouts) + " |",
+                "|---|" + "---|" * len(layouts)]
+        for m in models:
+            out.append(f"| {MODELS[m][0]} | "
+                       + " | ".join(cell_text(st, f"{m}_{k}{suffix}", final) for k in layouts) + " |")
+        out.append("")
+    done = bench_done(st)
+    results = {rid: bench_results(a["job"]) for rid, r, a in done}
+    if done:
+        out += bench_tables(st, done, results)
     attempts = sorted(((a.get("submitted", 0), rid, i, a) for rid, r in st["runs"].items()
                        for i, a in enumerate(r["attempts"], 1)), key=lambda x: x[0])
-    out += ["", "## Attempts", "",
-            "| Cell | Try | Job | Result | exact_match | Class | Nodes | Minutes | Note |",
+    out += ["## Attempts", "",
+            "| Cell | Try | Job | Result | Score | Class | Nodes | Minutes | Note |",
             "|---|---|---|---|---|---|---|---|---|"]
     for t0, rid, i, a in attempts:
         r = st["runs"][rid]
         took = int(((a.get("ended") or now) - t0) // 60) if t0 else "-"
         nodes = re.sub(r"crsuse2-m2m-v3-", "", a.get("nodes") or "-")
         note = (a.get("note") or "-").replace("|", "/").replace("`", "'")[:160]
-        out.append(f"| {MODELS[r['model']][0]} {r['layout'].upper().replace('-', ' ')} | {i} | {a.get('job') or '-'} | "
+        out.append(f"| {cell_name(r)}{' bench' if r['workload'] == 'bench' else ''} | {i} | {a.get('job') or '-'} | "
                    f"{a.get('verdict') or 'running'} | {a.get('score') or '-'} | {a.get('class') or '-'} | "
                    f"{nodes} | {took} | {note} |")
     tmp = SUMMARY + ".tmp"
     with open(tmp, "w") as f:
         f.write("\n".join(out) + "\n")
     os.replace(tmp, SUMMARY)
+    if c["bench"]["cells"]:
+        write_bench_tsv(done, results)
 
 
 def loop(st):
@@ -702,9 +967,10 @@ def loop(st):
         if done:
             ssh(push_results_cmd(), timeout=120)
             c = tally(st)
-            say(f"MATRIX DONE: {c['pass']} passed, {c['fail']} failed, {c['xfail']} failed as expected, "
-                f"{c['queued']} not run; {SUMMARY}")
-            return 0 if c["fail"] == 0 and c["queued"] == 0 else 1
+            say("MATRIX DONE: " + "; ".join(f"{name} {tally_text(c[w], True, w)}" for w, name in
+                                            (("accuracy", "accuracy"), ("bench", "benchmarks")) if c[w]["cells"])
+                + f"; {SUMMARY}")
+            return 0 if all(t["fail"] == 0 and t["queued"] == 0 for t in c.values()) else 1
         beat()
         time.sleep(POLL_S)
 
@@ -712,10 +978,11 @@ def loop(st):
 def parse_args(argv):
     def names(s):
         return [x for x in s.split(",") if x]
-    p = argparse.ArgumentParser(description="Drive the disagg gsm8k model matrix on Crusoe Spur.")
+    p = argparse.ArgumentParser(description="Drive the disagg gsm8k model matrix and its benchmarks on Crusoe Spur.")
     p.add_argument("--models", type=names, help=f"model keys (default: all of {','.join(MODELS)})")
     p.add_argument("--layouts", type=names, help=f"layouts (default: all of {','.join(LAYOUTS)})")
-    p.add_argument("--cells", type=names, help="cells such as glm_2p1d-ep (default: all)")
+    p.add_argument("--cells", type=names, help="cells such as glm_2p1d-ep or glm_2p1d-ep_bench (default: all)")
+    p.add_argument("--no-bench", action="store_true", help="leave out the benchmark cells")
     p.add_argument("--image", help="vLLM image (default: the nightly tag, resolved to a digest)")
     p.add_argument("--router-image", help="vllm-router image (default: the nightly tag, resolved to a digest)")
     p.add_argument("--ep-gate", action="store_true", help="run the EP pilot first; other EP cells wait for it to pass")
@@ -726,12 +993,22 @@ def parse_args(argv):
 def main(argv=None):
     global EP_GATE
     args = parse_args(argv)
-    cells = select_cells(args.models, args.layouts, args.cells)
+    cells = select_cells(args.models, args.layouts, args.cells, bench=not args.no_bench)
     if args.list:
         print("\n".join(cells))
         return 0
     if not cells:
         say("DRIVER ERROR: no cell matches the selection")
+        return 2
+    try:
+        if not bench_levels({"bench": BENCH}) or int(BENCH["prompts"]) < 1:
+            raise ValueError("no levels")
+        if BENCH["defer_timeout"] and not re.fullmatch(r"[0-9]+(\.[0-9]+)?", BENCH["defer_timeout"]):
+            raise ValueError("defer timeout")
+    except (ValueError, IndexError):
+        say(f"DRIVER ERROR: bad benchmark settings MX_BENCH_ISL_OSL={BENCH['isl_osl']!r} "
+            f"MX_BENCH_CON={BENCH['con']!r} MX_BENCH_PROMPTS={BENCH['prompts']!r} "
+            f"MX_BENCH_DEFER_TIMEOUT={BENCH['defer_timeout']!r}")
         return 2
     if SSH_MODE not in ("tty", "cmd"):
         say(f"DRIVER ERROR: MX_SSH_MODE must be tty or cmd, not {SSH_MODE!r}")
@@ -745,17 +1022,26 @@ def main(argv=None):
     st = load(cells)
     if "started" not in st:
         now = time.time()
+        seen = last_benched()
         st.update(started=now, cutoff=cutoff_after(now, NO_NEW_AFTER), commit=COMMIT or git_head(),
-                  remote_root=REMOTE_ROOT, images={"vllm": args.image or resolve(IMAGES["vllm"]),
-                                                   "router": args.router_image or resolve(IMAGES["router"])})
+                  remote_root=REMOTE_ROOT, bench_order=sorted(BENCH_ORDER, key=lambda c: seen.get(c, 0)),
+                  images={"vllm": args.image or resolve(IMAGES["vllm"]),
+                          "router": args.router_image or resolve(IMAGES["router"])})
     elif args.image or args.router_image:
         say("DRIVER WARN: resuming a run, which keeps its images; --image and --router-image are ignored")
     st.pop("stopped", None)
     save(st)
     write_summary(st)
-    say(f"driver up: {len(st['runs'])} cells, {sum(r['status'] == 'queued' for r in st['runs'].values())} queued, "
+    n_bench = sum(r["workload"] == "bench" for r in st["runs"].values())
+    say(f"driver up: {len(st['runs'])} cells ({n_bench} benchmarks), "
+        f"{sum(r['status'] == 'queued' for r in st['runs'].values())} queued, "
         f"budget {MAX_NODES} nodes, no new cell after {cutoff_text(st) if st.get('cutoff') else 'never'}, "
         f"EP gate {st['ep_gate']}, expected failures {','.join(sorted(XFAIL)) or 'none'}, poll {POLL_S}s")
+    if n_bench:
+        b = st["bench"]
+        say(f"benchmarks: {b['isl_osl']} at concurrency {b['con']}, {b['prompts']}x prompts, "
+            f"walltime {b['time_limit']}, MoRIIO defer timeout {b.get('defer_timeout') or 'default'}; "
+            f"order {','.join(c for c in st.get('bench_order') or BENCH_ORDER if c in st['runs'])}")
     say(f"images {st['images']['vllm']} and {st['images']['router']}; code {st['commit']}")
     if "MX_REMOTE_OK" not in (ssh(f"test -f {REMOTE}/submit.sh && echo MX_REMOTE_OK\n", timeout=120) or ""):
         say(f"DRIVER ERROR: no {REMOTE}/submit.sh on {HOST}, or the login failed")
