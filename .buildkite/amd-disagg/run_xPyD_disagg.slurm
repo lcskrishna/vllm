@@ -516,6 +516,10 @@ run_node_container() {
                    && docker commit "$vp_cont" "$vp_tag" >/dev/null; then
                     echo "Rank $rank vllm patches: committed $vp_tag"
                     vp_rc=0
+                    # Every new base image bakes a new tag; keep only this one on
+                    # the shared node. Tags still used by a container stay.
+                    docker images --format '{{.Repository}}:{{.Tag}}' vllm-disagg-patched \
+                        | grep -vxF "$vp_tag" | xargs -r docker rmi >/dev/null 2>&1 || true
                 else
                     echo "ERROR: rank $rank vllm patches ($VLLM_PATCHES) failed on $(hostname)" >&2
                     vp_rc=1
