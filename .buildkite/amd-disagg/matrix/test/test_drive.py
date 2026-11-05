@@ -8,9 +8,10 @@ import sys
 
 T = os.path.dirname(os.path.abspath(__file__))
 shutil.copy(os.path.join(T, "..", "drive.py"), os.path.join(T, "drive_t.py"))
-for f in ("state.json", "results.tsv", "summary.md", "control.txt", "driver.lock"):
+for f in ("state.json", "results.tsv", "bench.tsv", "summary.md", "control.txt", "driver.lock"):
     if os.path.exists(os.path.join(T, f)):
         os.remove(os.path.join(T, f))
+shutil.rmtree(os.path.join(T, "logs"), ignore_errors=True)
 for k in [k for k in os.environ if k.startswith("MX_")]:
     del os.environ[k]
 os.environ["MX_REMOTE_DIR"] = "/remote/run"

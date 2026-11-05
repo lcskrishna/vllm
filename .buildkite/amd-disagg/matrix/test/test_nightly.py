@@ -6,6 +6,8 @@ import sys
 import time
 from datetime import datetime
 
+from bench_fixtures import bench_json
+
 sys.argv = ["x"]
 T = os.path.dirname(os.path.abspath(__file__))
 exec(open(os.path.join(T, "test_drive.py")).read().split("step()\nprint(\"start:\"")[0])
@@ -77,9 +79,10 @@ assert inflight() == ["glm_2p1d-ep"] and len(st["runs"]["glm_2p1d-ep"]["attempts
 finish("glm_2p1d-ep", "1", "FAIL: exact_match=0.10", "accuracy", "FAIL: exact_match=0.10")
 step()
 assert st["runs"]["glm_2p1d-ep"]["status"] == "done" and len(st["runs"]["glm_2p1d-ep"]["attempts"]) == 2
-assert d.finished(st) and d.tally(st)["xfail"] == 1
+assert d.finished(st) and d.tally(st)["accuracy"]["xfail"] == 1
 
 # A whole pass through loop(): only the expected failure fails, so the exit code is 0.
+# Its benchmark is skipped; the other 19 run after the last accuracy cell.
 fresh()
 st.update(started=time.time() - 3600, commit="abc1234 on csrikris-crusoe", remote_root="/remote/run")
 
@@ -88,6 +91,9 @@ def finish_all(_):
     for rid in d.inflight(st):
         if rid == "glm_2p1d-ep":
             finish(rid, "1", "-", "stall", "no gsm8k progress")
+        elif rid.endswith("_bench"):
+            finish(rid, "0", "PASS: bench=4/4", "pass")
+            bench_json(d.LOGS, st["runs"][rid]["attempts"][-1]["job"])
         else:
             finish(rid, "0", "PASS: exact_match=0.951234", "pass")
 
@@ -96,9 +102,31 @@ d.time.sleep = finish_all
 assert d.loop(st) == 0
 summary = open(d.SUMMARY).read()
 print(summary)
-assert "- Result: 19 of 20 cells passed, 0 failed, 1 failed as expected, 0 not run." in summary
+assert "- Accuracy: 19 of 20 cells passed, 0 failed, 1 failed as expected, 0 not run." in summary
+assert ("- Benchmarks: 19 of 20 cells passed, 0 failed, 1 skipped because the accuracy cell didn't pass, "
+        "0 not run.") in summary
 assert "| GLM-5.2-FP8 | PASS 0.9512 | PASS 0.9512 | PASS 0.9512 | XFAIL (stall) | PASS 0.9512 |" in summary
-assert len(summary.split("## Attempts")[1].strip().splitlines()) == 2 + 20
+assert "| GLM-5.2-FP8 | PASS 4/4 | PASS 4/4 | PASS 4/4 | skipped | PASS 4/4 |" in summary
+# 100 * concurrency output tok/s over 16 or 24 GPUs.
+assert "| MiniMax-M3-MXFP8 1P1D TP8 | 16 | 50.0 | 100.0 | 200.0 | 400.0 |" in summary
+assert "| GLM-5.2-FP8 2P1D TP8 | 24 | 33.3 | 66.7 | 133.3 | 266.7 |" in summary
+assert "| 64 | 128/128 | 6400.0 | 400.0 | 57600.0 | 500 / 900 | 10.0 / 12.0 | 9.0 / 20.0 | 11.0 / 13.0 | 124 |" in summary
+assert "MoRIIO lets a prefill wait 600 s for decode KV blocks" in summary
+assert len(summary.split("## Attempts")[1].strip().splitlines()) == 2 + 20 + 19
+order = [s[0] for s in submits]
+assert max(order.index(c) for c in d.ACC_ORDER) < min(order.index(c) for c in order if c.endswith("_bench"))
+assert [c for c in order if c.endswith("_bench")] == [c for c in d.BENCH_ORDER if c != "glm_2p1d-ep_bench"]
+bench_env = next(s[2] for s in submits if s[0] == "kimi_1p2d-ep_bench")
+for kv in ("RUN_AFTER_HEALTH=bench", "BENCHMARK_COMBINATIONS=8192/1024", "BENCHMARK_CON='8 16 32 64'",
+           "NUM_PROMPTS_FACTOR=2", "BENCHMARK_MIN_PROMPTS=32", "SLURM_TIME_LIMIT=02:00:00", "MORIIO_DEFER_TIMEOUT=600",
+           "MX_ID=kimi_1p2d-ep_bench"):
+    assert kv in bench_env, (kv, bench_env)
+acc_env = next(s[2] for s in submits if s[0] == "kimi_1p2d-ep")
+assert "RUN_AFTER_HEALTH" not in acc_env and "MORIIO_DEFER_TIMEOUT" not in acc_env
+tsv = open(d.BENCH_TSV).read().splitlines()
+assert len(tsv) == 1 + 19 * 4 and tsv[0].split("\t") == d.BENCH_TSV_COLS
+row = dict(zip(d.BENCH_TSV_COLS, tsv[1].split("\t")))
+assert row["id"] == "dsv4_1p1d-tp8_bench" and row["concurrency"] == "8" and row["output_throughput_per_gpu"] == "50.000"
 
 # Past the cutoff nothing starts; what's left is "not run" and the exit code is 1.
 fresh(["kimi_1p1d-tp8", "kimi_2p1d-tp8"])
@@ -117,8 +145,12 @@ assert d.cutoff_text({"started": night, "cutoff": d.cutoff_after(night, "09:00")
 assert d.cutoff_text({"started": afternoon, "cutoff": d.cutoff_after(afternoon, "09:00")}) == "2026-11-07 09:00 IST"
 
 # Cell selection; with the gate on, a selection without the pilot doesn't wait for it.
-assert d.select_cells(models=["glm"], layouts=["2p1d-ep", "1p1d-tp8"]) == ["glm_1p1d-tp8", "glm_2p1d-ep"]
-assert d.select_cells(cells=["kimi_1p2d-ep"]) == ["kimi_1p2d-ep"] and len(d.select_cells()) == 20
+assert d.select_cells(models=["glm"], layouts=["2p1d-ep", "1p1d-tp8"]) == [
+    "glm_1p1d-tp8", "glm_2p1d-ep", "glm_1p1d-tp8_bench", "glm_2p1d-ep_bench"]
+assert d.select_cells(models=["glm"], layouts=["2p1d-ep"], bench=False) == ["glm_2p1d-ep"]
+assert d.select_cells(cells=["kimi_1p2d-ep"]) == ["kimi_1p2d-ep"] and len(d.select_cells()) == 40
+assert d.select_cells(cells=["kimi_1p2d-ep_bench"]) == ["kimi_1p2d-ep_bench"]
+assert len(d.select_cells(bench=False)) == 20
 try:
     d.select_cells(models=["llama"])
     raise AssertionError("an unknown model was accepted")

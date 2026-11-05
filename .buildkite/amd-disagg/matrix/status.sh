@@ -10,7 +10,7 @@ for j in "$@"; do
     log="$L/vllm-disagg-pd-$j.log"; d="$L/$j"
     st=$(timeout 15 scontrol show job "$j" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | head -n1 | cut -d= -f2)
     rc=$(tr -dc 0-9 < "$d/.disagg_done" 2>/dev/null)
-    gate=$(grep -ahoE '(PASS|FAIL): exact_match=[0-9.]+' "$log" 2>/dev/null | tail -n1)
+    gate=$(grep -ahoE '(PASS|FAIL): (exact_match=[0-9.]+|bench=[0-9]+/[0-9]+)' "$log" 2>/dev/null | tail -n1)
     nodes=$(grep -aoE '^SLURM_JOB_NODELIST: [^ ]+' "$log" 2>/dev/null | tail -n1 | cut -d' ' -f2)
     image=$(grep -m1 -aoE 'Digest: sha256:[0-9a-f]{12}' "$log" 2>/dev/null | cut -d: -f3)
     # VLLM_PATCHES baked into the run image, e.g. "+pr65098-moriio-remote-hosts".
@@ -18,9 +18,11 @@ for j in "$@"; do
     for p in $patches; do image="${image:--}+$(basename "$p" .diff)"; done
     need=$(grep -aoE 'waiting on [0-9]+' "$log" 2>/dev/null | grep -oE '[0-9]+' | tail -n1)
     healthy=$(grep -acE '\] healthy: ' "$log" 2>/dev/null)
-    # Seconds since lm_eval last wrote progress; "-" until gsm8k has started.
-    acc=$(ls -t "$d"/accuracy_*.log 2>/dev/null | head -n1)
+    # Seconds since lm_eval or vllm bench serve last wrote progress; "-" until
+    # the workload has started. levels: benchmark levels that wrote a result.
+    acc=$(ls -t "$d"/accuracy_*.log "$d"/bench_*/bench_*.log 2>/dev/null | head -n1)
     idle=-; [[ -n "$acc" ]] && idle=$(( $(date +%s) - $(stat -c %Y "$acc") ))
+    levels=$(ls "$d"/bench_*/bench_*.json 2>/dev/null | wc -l)
     vllm=- cls=- note=-
     case "$st" in RUNNING|COMPLETING|PENDING|CONFIGURING|REQUEUED) over=0 ;; *) over=1 ;; esac
     [[ -n "$rc" ]] && over=1
@@ -37,6 +39,8 @@ for j in "$@"; do
             cls=kvlen note=$n
         elif n=$(first "$OOM" "${logs[@]}"); [[ -n "$n" ]]; then
             cls=oom note=$n
+        elif [[ "$gate" == "FAIL: bench"* ]]; then
+            cls=bench note=$(grep -ahoE 'FAIL: bench=.{0,180}' "$log" | tail -n1 | tr -d '\r' | tr '\t|' '  ')
         elif [[ "$gate" == FAIL* ]]; then
             cls=accuracy note=$gate
         elif n=$(first 'remote blocks never arrived' "${logs[@]}"); [[ -n "$n" ]]; then
@@ -50,5 +54,5 @@ for j in "$@"; do
             cls=unknown
         fi
     fi
-    echo "MX_STATUS $j|state=${st:--}|rc=${rc:--}|gate=${gate:--}|healthy=${healthy:-0}/${need:--}|nodes=${nodes:--}|image=${image:--}|vllm=${vllm:--}|idle=$idle|class=$cls|note=$note" | tr -d '\r'
+    echo "MX_STATUS $j|state=${st:--}|rc=${rc:--}|gate=${gate:--}|healthy=${healthy:-0}/${need:--}|nodes=${nodes:--}|image=${image:--}|vllm=${vllm:--}|idle=$idle|levels=$levels|class=$cls|note=$note" | tr -d '\r'
 done

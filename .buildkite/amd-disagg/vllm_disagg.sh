@@ -91,6 +91,11 @@ load_config() {
 
     # MoRIIO KV transfer direction. 0 (default)
     MORIIO_READ_MODE="${MORIIO_READ_MODE:-0}"
+    # Seconds a write-mode prefill waits for decode KV blocks before failing the
+    # request; empty leaves MoRIIO's default (60).
+    MORIIO_DEFER_TIMEOUT="${MORIIO_DEFER_TIMEOUT:-}"
+    [[ -z "${MORIIO_DEFER_TIMEOUT}" || "${MORIIO_DEFER_TIMEOUT}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+        || die "MORIIO_DEFER_TIMEOUT='${MORIIO_DEFER_TIMEOUT}' is not a number of seconds"
 }
 
 # Emits the `read_mode` KV-config fragment (leading comma + newline) when read
@@ -100,6 +105,13 @@ moriio_read_mode_kv() {
         1|true|True|TRUE|yes|on) printf ',\n    "read_mode": true' ;;
         *) : ;;
     esac
+}
+
+# Emits the `defer_timeout` KV-config fragment when MORIIO_DEFER_TIMEOUT is set.
+moriio_defer_timeout_kv() {
+    if [[ -n "${MORIIO_DEFER_TIMEOUT:-}" ]]; then
+        printf ',\n    "defer_timeout": %s' "${MORIIO_DEFER_TIMEOUT}"
+    fi
 }
 
 # NIXL KV config. UCX backend.
@@ -152,6 +164,56 @@ start_proxy_bg() {
     PROXY_PID=$!
 }
 
+# One line about a level from its `vllm bench serve` result JSON; fails unless
+# every prompt completed.
+bench_level_summary() {  # $1=result json  $2=num_prompts
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+path, want = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path) as f:
+        r = json.load(f)
+except (OSError, ValueError) as e:
+    print(f"no result ({e})")
+    sys.exit(1)
+ok, failed = r.get("completed", 0), r.get("failed", 0)
+print(f"{ok}/{want} requests ok, {failed} failed; output {r.get('output_throughput', 0):.1f} tok/s, "
+      f"total {r.get('total_token_throughput', 0):.1f} tok/s; median TTFT {r.get('median_ttft_ms', 0):.0f} ms, "
+      f"median TPOT {r.get('median_tpot_ms', 0):.1f} ms")
+sys.exit(0 if ok == want and not failed else 1)
+PY
+}
+
+# vllm bench serve at $1 on random prompts. $2=isl $3=osl $4=concurrency
+# $5=num_prompts $6=seed; any further arguments are passed on.
+bench_serve() {
+    local base_url="$1" isl="$2" osl="$3" con="$4" nump="$5" seed="$6"
+    shift 6
+    vllm bench serve \
+        --backend openai \
+        --base-url "${base_url}" \
+        --endpoint /v1/completions \
+        --model "${MODEL_PATH}" \
+        --dataset-name random \
+        --random-input-len "${isl}" \
+        --random-output-len "${osl}" \
+        --num-prompts "${nump}" \
+        --max-concurrency "${con}" \
+        --percentile-metrics ttft,tpot,itl,e2el \
+        --ignore-eos \
+        --seed "${seed}" \
+        "$@"
+}
+
+level_prompts() {  # $1=concurrency
+    local n=$(( NUM_PROMPTS_FACTOR * $1 ))
+    (( n < BENCHMARK_MIN_PROMPTS )) && n="${BENCHMARK_MIN_PROMPTS}"
+    echo "${n}"
+}
+
+# Every ISL/OSL x concurrency level in turn, each saving its result JSON next to
+# its log. Stops at the first level where a request fails, and ends with a
+# "PASS|FAIL: bench=<levels ok>/<levels>" gate line.
 run_bench() {
     local base_url="http://127.0.0.1:${GATEWAY_PORT:-${PROXY_PORT}}"
     local result_dir="${LOG_PATH}/bench_$(date +%Y%m%d_%H%M%S)"
@@ -159,30 +221,53 @@ run_bench() {
     log "bench -> ${base_url} model=${MODEL_PATH} wide_ep_mode=${WIDE_EP_MODE}(${PARALLEL_MODE})"
     log "combinations='${BENCHMARK_COMBINATIONS}' concurrency='${BENCHMARK_CON}'"
 
-    local combo isl osl con nump logf
-    for combo in ${BENCHMARK_COMBINATIONS}; do
+    local -a combos cons
+    read -ra combos <<< "${BENCHMARK_COMBINATIONS}"
+    read -ra cons <<< "${BENCHMARK_CON}"
+    local total=$(( ${#combos[@]} * ${#cons[@]} )) level=0 ok=0 failed=""
+    local combo isl osl con nump name rc summary
+    if (( total == 0 )); then
+        log "FAIL: bench=0/0 levels; BENCHMARK_COMBINATIONS or BENCHMARK_CON is empty"
+        return 1
+    fi
+    # The first requests after startup are much slower, so a warmup at the first
+    # level's settings goes first; its results aren't kept.
+    isl="${combos[0]%%/*}"; osl="${combos[0]##*/}"; con="${cons[0]}"; nump="$(level_prompts "${con}")"
+    log "warmup: ISL=${isl} OSL=${osl} CON=${con} num_prompts=${nump}, not recorded -> ${result_dir}/bench_warmup.log"
+    rc=0
+    bench_serve "${base_url}" "${isl}" "${osl}" "${con}" "${nump}" 0 > "${result_dir}/bench_warmup.log" 2>&1 || rc=$?
+    (( rc == 0 )) || log "warmup failed (rc=${rc}); going on with the levels"
+    for combo in "${combos[@]}"; do
         isl="${combo%%/*}"; osl="${combo##*/}"
-        for con in ${BENCHMARK_CON}; do
-            nump=$(( NUM_PROMPTS_FACTOR * con ))
-            (( nump < BENCHMARK_MIN_PROMPTS )) && nump="${BENCHMARK_MIN_PROMPTS}"
-            logf="${result_dir}/bench_${isl}_${osl}_con${con}.log"
-            log "ISL=${isl} OSL=${osl} CON=${con} num_prompts=${nump} -> ${logf}"
-            vllm bench serve \
-                --backend openai \
-                --base-url "${base_url}" \
-                --endpoint /v1/completions \
-                --model "${MODEL_PATH}" \
-                --dataset-name random \
-                --random-input-len "${isl}" \
-                --random-output-len "${osl}" \
-                --num-prompts "${nump}" \
-                --max-concurrency "${con}" \
-                --percentile-metrics ttft,tpot,itl,e2el \
-                --ignore-eos \
-                2>&1 | tee "${logf}"
+        for con in "${cons[@]}"; do
+            level=$(( level + 1 ))
+            nump="$(level_prompts "${con}")"
+            name="bench_${isl}_${osl}_con${con}"
+            log "ISL=${isl} OSL=${osl} CON=${con} num_prompts=${nump} -> ${result_dir}/${name}.log"
+            # A seed per level, and 0 for the warmup: with one seed every level would
+            # resend the previous level's prompts, and prefix caching would serve them.
+            rc=0
+            ( set -o pipefail
+              bench_serve "${base_url}" "${isl}" "${osl}" "${con}" "${nump}" "${level}" \
+                --save-result --result-dir "${result_dir}" --result-filename "${name}.json" \
+                2>&1 | tee "${result_dir}/${name}.log"
+            ) || rc=$?
+            if summary="$(bench_level_summary "${result_dir}/${name}.json" "${nump}")" && (( rc == 0 )); then
+                ok=$(( ok + 1 ))
+                log "bench ${isl}/${osl} con=${con}: ${summary}"
+            else
+                log "bench ${isl}/${osl} con=${con} failed (rc=${rc}): ${summary}"
+                failed="${isl}/${osl} con=${con}"
+                break 2
+            fi
         done
     done
-    log "bench complete. Results in ${result_dir}"
+    if [[ -z "${failed}" ]]; then
+        log "PASS: bench=${ok}/${total} levels. Results in ${result_dir}"
+        return 0
+    fi
+    log "FAIL: bench=${ok}/${total} levels; ${failed} failed, so later levels didn't run. Results in ${result_dir}"
+    return 1
 }
 
 run_accuracy() {
@@ -310,8 +395,9 @@ build_tp_cmd() {
     [[ -n "${HOST_IP}" ]] && CMD+=(--host "${HOST_IP}")
     CMD+=(--port "${port}" --tensor-parallel-size "${TP_SIZE}")
     local _mc; read -ra _mc <<< "${MODEL_CONFIG}"; CMD+=("${_mc[@]}")
-    local kv_cfg read_mode_kv
+    local kv_cfg read_mode_kv defer_kv
     read_mode_kv="$(moriio_read_mode_kv)"
+    defer_kv="$(moriio_defer_timeout_kv)"
     kv_cfg=$(cat <<EOF
 {
   "kv_connector": "MoRIIOConnector",
@@ -321,14 +407,14 @@ build_tp_cmd() {
     "proxy_ping_port": "${PROXY_PING_PORT}",
     "http_port": "${port}",
     "handshake_port": "${HANDSHAKE_PORT}",
-    "notify_port": "${NOTIFY_PORT}"${read_mode_kv}
+    "notify_port": "${NOTIFY_PORT}"${read_mode_kv}${defer_kv}
   }
 }
 EOF
 )
     if [[ "${KV_CONNECTOR:-}" == Nixl* ]]; then kv_cfg="$(nixl_kv_cfg)"; fi
     CMD+=(--kv-transfer-config "${kv_cfg}")
-    log "role=${ROLE} mode=tp host=${HOST_IP:-0.0.0.0}:${port} kv_role=${KV_ROLE} tp=${TP_SIZE} read_mode=${MORIIO_READ_MODE}"
+    log "role=${ROLE} mode=tp host=${HOST_IP:-0.0.0.0}:${port} kv_role=${KV_ROLE} tp=${TP_SIZE} read_mode=${MORIIO_READ_MODE} defer_timeout=${MORIIO_DEFER_TIMEOUT:-default}"
 }
 
 # Build the EP-mode (WIDE_EP_MODE=1) serve command into the global CMD array.
@@ -360,8 +446,9 @@ build_ep_cmd() {
         CMD+=(--gpu-memory-utilization 0.75)
     fi
 
-    local kv_cfg read_mode_kv peer_hosts
+    local kv_cfg read_mode_kv defer_kv peer_hosts
     read_mode_kv="$(moriio_read_mode_kv)"
+    defer_kv="$(moriio_defer_timeout_kv)"
     if [[ "${ROLE}" == "prefill" ]]; then
         peer_hosts=$(printf '"%s",' "${IP_ARRAY[@]:xP:yD}")
     else
@@ -381,7 +468,7 @@ build_ep_cmd() {
     "handshake_port": "${HANDSHAKE_PORT}",
     "notify_port": "${NOTIFY_PORT}",
     "remote_hosts": [${peer_hosts%,}],
-    "remote_dp_size_local": ${GPUS_PER_NODE}${read_mode_kv}
+    "remote_dp_size_local": ${GPUS_PER_NODE}${read_mode_kv}${defer_kv}
   }
 }
 EOF
@@ -390,7 +477,7 @@ EOF
         CMD+=(--api-server-count="${GPUS_PER_NODE}")
         if [[ "${KV_CONNECTOR:-}" == Nixl* ]]; then kv_cfg="$(nixl_kv_cfg)"; fi
         CMD+=(--kv-transfer-config "${kv_cfg}")
-        log "role=${ROLE} mode=ep MASTER node_rank=${NODE_RANK} dp_size=${DP_GROUP_SIZE} dp_addr=${DP_MASTER_ADDR} kv_role=${KV_ROLE} all2all=${backend} read_mode=${MORIIO_READ_MODE}"
+        log "role=${ROLE} mode=ep MASTER node_rank=${NODE_RANK} dp_size=${DP_GROUP_SIZE} dp_addr=${DP_MASTER_ADDR} kv_role=${KV_ROLE} all2all=${backend} read_mode=${MORIIO_READ_MODE} defer_timeout=${MORIIO_DEFER_TIMEOUT:-default}"
     else
         CMD+=(--data-parallel-start-rank "${DP_START_RANK}" --headless)
         [[ "${KV_CONNECTOR:-}" == Nixl* ]] || CMD+=(--kv-transfer-config "${kv_cfg}")
