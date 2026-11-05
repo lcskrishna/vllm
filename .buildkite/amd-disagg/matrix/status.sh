@@ -2,7 +2,8 @@
 # status.sh <job-id>...: one "MX_STATUS" line per matrix job. The verdict sources
 # match run-slurm-disagg-test.sh's WAIT=1 poll: the .disagg_done sentinel (rank-0
 # rc), then the gate line. class/note are only filled in once the job is over.
-L=/shared_nfs/csrikris/logs
+source "$(dirname "$0")/crusoe.env"
+L="${LOG_ROOT}"
 OOM='HSA_STATUS_ERROR_OUT_OF_RESOURCES|OutOfMemoryError|(CUDA|HIP) out of memory|0 bytes free|No available memory for the cache blocks'
 first() { grep -m1 -ahoE ".{0,40}($1).{0,160}" "${@:2}" 2>/dev/null | head -n1 | tr -d '\r' | tr '\t|' '  '; }
 for j in "$@"; do

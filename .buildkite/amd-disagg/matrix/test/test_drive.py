@@ -8,17 +8,27 @@ import sys
 
 T = os.path.dirname(os.path.abspath(__file__))
 shutil.copy(os.path.join(T, "..", "drive.py"), os.path.join(T, "drive_t.py"))
-for f in ("state.json", "results.tsv", "control.txt"):
+for f in ("state.json", "results.tsv", "summary.md", "control.txt", "driver.lock"):
     if os.path.exists(os.path.join(T, f)):
         os.remove(os.path.join(T, f))
+for k in [k for k in os.environ if k.startswith("MX_")]:
+    del os.environ[k]
+os.environ["MX_REMOTE_DIR"] = "/remote/run"
 spec = importlib.util.spec_from_file_location("drive_t", os.path.join(T, "drive_t.py"))
 d = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(d)
+# These scenarios run a TP and an EP cell side by side, which takes 5 nodes, and
+# go through the EP pilot gate.
+d.MAX_NODES = 5
+d.EP_GATE = True
+d.pull_logs = lambda job: None
 
-jobs = {}        # job -> fields dict
+jobs = {}        # job -> fields dict, plus "n": its node count
 next_job = [1000]
 submits = []
 cancels = []
+foreign = []     # (job, nodes, state) of the user's other Spur jobs
+squeue = {"rc": 0, "hide_ours": False}
 
 
 def fake_ssh(body, timeout=300):
@@ -31,18 +41,27 @@ def fake_ssh(body, timeout=300):
         next_job[0] += 1
         j = str(next_job[0])
         rid = body.split("MX_ID=")[1].split()[0]
+        layout = body.split("bash submit.sh ")[1].split()[0]
         submits.append((rid, j, body))
-        jobs[j] = {"state": "PENDING", "rc": "-", "gate": "-", "class": "-", "note": "-"}
+        jobs[j] = {"state": "PENDING", "rc": "-", "gate": "-", "class": "-", "note": "-", "n": d.LAYOUTS[layout]}
         out.append(f"MX_JOB {j}")
     if "bash status.sh" in body:
         for j in body.split("bash status.sh", 1)[1].split("\n")[0].split():
-            f = jobs[j]
+            f = {k: v for k, v in jobs[j].items() if k != "n"}
             out.append(f"MX_STATUS {j}|" + "|".join(f"{k}={v}" for k, v in f.items())
                        + "|healthy=0/2|nodes=n1,n2|image=abc|vllm=0.33")
+    if "squeue" in body:
+        out.append("MX_SQ_BEGIN")
+        if not squeue["hide_ours"]:
+            out += [f"{j}:{f['n']}:{f['state']}" for j, f in jobs.items() if f["state"] in ("PENDING", "RUNNING")]
+        out += [f"{j}:{n}:{s}" for j, n, s in foreign]
+        out.append(f"MX_SQ_END rc={squeue['rc']}")
+    if "test -f" in body and "submit.sh" in body:
+        out.append("MX_REMOTE_OK")
     return "\n".join(out) + "\n"
 
 
-d.ssh = fake_ssh
+real_ssh, d.ssh = d.ssh, fake_ssh
 st = d.new_state()
 
 
@@ -53,12 +72,7 @@ def finish(rid, rc, gate="-", cls="-", note="-"):
 
 
 def step():
-    d.poll(st)
-    while True:
-        rid = d.pick(st)
-        if not rid:
-            break
-        d.submit(st, rid)
+    d.start_cells(st, d.poll(st))
 
 
 def inflight():
@@ -127,8 +141,12 @@ for _ in range(200):
 order = [s[0] for s in submits]
 print("submit order:", order)
 assert all(r["status"] == "done" for r in st["runs"].values())
-ep_order = [o for o in order if o.endswith("-ep")]
-assert ep_order[-3:] == ["dsv4_1p1d-ep", "dsv4_2p1d-ep", "dsv4_1p2d-ep"], ep_order
+# A cell that needs fewer nodes may start ahead of one that doesn't fit yet, so
+# EP order holds among cells of the same size.
+ep_first = [o for i, o in enumerate(order) if o.endswith("-ep") and o not in order[:i]]
+for n in (2, 3):
+    same = [o for o in ep_first if d.LAYOUTS[o.split("_", 1)[1]] == n]
+    assert same == [o for o in d.EP_ORDER if o in same], (n, ep_first)
 assert any("KV_GIB=16" in s[2] for s in submits if s[0] == "minimax_1p1d-ep")
 d.save(st)
 print(open(d.RESULTS).read())
@@ -144,7 +162,7 @@ step()
 assert inflight() == [d.PILOT] and st["ep_gate"] == "pilot"
 finish(d.PILOT, "1", "-", "bringup", "TIMEOUT waiting for x")
 step()
-assert inflight() == [] and st["ep_gate"] == "blocked" and d.pick(st) is None
+assert inflight() == [] and st["ep_gate"] == "blocked" and d.pick(st, d.MAX_NODES) is None
 
 # gsm8k stops making progress: the driver cancels the job once, records a stall, retries once.
 st = d.new_state()

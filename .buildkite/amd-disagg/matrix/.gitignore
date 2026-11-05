@@ -1,6 +1,9 @@
 state.json
 state.json.tmp
 results.tsv
+summary.md
+summary.md.tmp
+logs/
 drive.log
 jobs.log
 control.txt
