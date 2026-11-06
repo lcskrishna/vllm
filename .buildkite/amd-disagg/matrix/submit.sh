@@ -14,7 +14,7 @@
 # the run in jobs.log, so a driver that lost the ssh session mid-submit can
 # still find the job.
 set -euo pipefail
-[[ $# -eq 1 ]] || { echo "usage: MODEL_NAME=... MODEL_DIR=... $0 <1p1d-tp8|2p1d-tp8|1p2d-tp8|2p2d-tp8|1p1d-ep|2p1d-ep|1p2d-ep|2p2d-ep>" >&2; exit 2; }
+[[ $# -eq 1 ]] || { echo "usage: MODEL_NAME=... MODEL_DIR=... $0 <1p1d-tp8|2p1d-tp8|1p2d-tp8|2p2d-tp8|1p1d-tp4|2p1d-tp4|1p1d-ep|2p1d-ep|1p2d-ep|2p2d-ep>" >&2; exit 2; }
 : "${MODEL_NAME:?set MODEL_NAME}" "${MODEL_DIR:?set MODEL_DIR}"
 MX_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${MX_DIR}/crusoe.env"
@@ -23,6 +23,9 @@ case "$1" in
   2p1d-tp8) export NODES=3 xP=2 yD=1 WIDE_EP_MODE=0 ;;
   1p2d-tp8) export NODES=3 xP=1 yD=2 WIDE_EP_MODE=0 ;;
   2p2d-tp8) export NODES=4 xP=2 yD=2 WIDE_EP_MODE=0 ;;
+  # One TP4 server per node, on its first 4 GPUs.
+  1p1d-tp4) export NODES=2 xP=1 yD=1 WIDE_EP_MODE=0 TP_SIZE=4 ;;
+  2p1d-tp4) export NODES=3 xP=2 yD=1 WIDE_EP_MODE=0 TP_SIZE=4 ;;
   1p1d-ep)  export NODES=2 xP=1 yD=1 WIDE_EP_MODE=1 ;;
   2p1d-ep)  export NODES=3 xP=2 yD=1 WIDE_EP_MODE=1 ;;
   1p2d-ep)  export NODES=3 xP=1 yD=2 WIDE_EP_MODE=1 ;;
