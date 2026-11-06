@@ -22,8 +22,10 @@
 #                        exports these BEFORE `vllm serve`, but only if they are
 #                        not already set, so precedence is:
 #                            caller/inline env  >  models.yaml env:
+#                        Rank 0's workload sees them too (e.g. ACCURACY_CHAT).
 #                        (Transport/fabric/engine env stays in cluster.sh,
 #                         e.g. MORI_RDMA_DEVICES, NCCL_IB_HCA, VLLM_USE_V1.)
+#   tp_env / ep_env    : optional, merged over env in that mode
 #   base_flags         : always applied (both roles, both modes)
 #   prefill/decode.<tp|ep> : role + mode specific perf flags
 #   experimental_flags : optional extra flags (omit if empty)
@@ -77,6 +79,38 @@ models:
     decode:
       tp: "--gpu-memory-utilization 0.85"
       ep: '--gpu-memory-utilization 0.75 --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY","custom_ops":["+quant_fp8"]}'
+
+  # Mono decode (VLLM_ROCM_MINIMAX_M3_MONO) runs each decode layer as one kernel,
+  # but only at TP4 without DP/EP, with fp8 KV and index caches, the shuffled KV
+  # layout and full-decode CUDA graphs, and only for steps of at most 16 tokens;
+  # other steps fall back to the standard path. So run the TP layouts as -tp4, with
+  # TP4 in both roles: the RoCE rails don't route between NICs, and a TP8 prefill
+  # writes TP4 decode rank d's KV from rank 2d, whose NIC is on another rail. gsm8k
+  # needs ACCURACY_NUM_CONCURRENT=16 to run on the kernels. EP layouts serve without
+  # mono, on the standard KV layout and a bf16 index cache: a TP1 rank holds all 4
+  # indexer heads, which AITER's MSA indexer, gfx950's only fp8 one, has no kernel
+  # for. The model answers gsm8k only through its chat template (0.25 as plain
+  # completions, 0.96 as chat), so it is scored as chat, with its reasoning parsed
+  # out of the answer.
+  - model: MiniMax-M3.1-Flash-Quark-MXFP4
+    env:
+      ACCURACY_CHAT: "1"
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: "1"
+      VLLM_ROCM_MINIMAX_M3_MONO: "1"
+      VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: "INT4"
+      VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: "0"
+      VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: "256"
+      VLLM_KV_CACHE_LAYOUT: "HND"
+    ep_env:
+      VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: "0"
+    base_flags: "--trust-remote-code --language-model-only --dtype bfloat16 --tokenizer-mode hf --generation-config vllm --moe-backend aiter --attention-backend TRITON_ATTN --block-size 128 --kv-cache-dtype fp8 --max-model-len 131072 --reasoning-parser minimax_m3"
+    prefill:
+      tp: "--attention_config.indexer_kv_dtype fp8 --gpu-memory-utilization 0.85 --enforce-eager --max-num-batched-tokens 16384"
+      ep: "--gpu-memory-utilization 0.85 --enforce-eager"
+    decode:
+      tp: '--attention_config.indexer_kv_dtype fp8 --gpu-memory-utilization 0.85 --max-num-seqs 64 --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY"}'
+      ep: '--gpu-memory-utilization 0.75 --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY"}'
 
   - model: DeepSeek-R1-MXFP4
     env:

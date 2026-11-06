@@ -193,7 +193,7 @@ old["runs"]["glm_2p1d-ep"]["status"] = "inflight"
 with open(d.STATE, "w") as f:
     json.dump(old, f)
 merged = d.load()
-assert all(merged["runs"][f"{m}_1p1d-ep"]["status"] == "queued" for m in d.MODELS)
+assert all(merged["runs"][rid]["status"] == "queued" for rid in d.ACC_ORDER if rid.endswith("_1p1d-ep"))
 assert merged["runs"]["glm_2p1d-ep"]["status"] == "inflight" and merged["ep_gate"] == old["ep_gate"]
 
 # A dead driver on this host does not hold the lock; a live or remote one does.

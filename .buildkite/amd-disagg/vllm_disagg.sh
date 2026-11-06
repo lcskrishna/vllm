@@ -277,7 +277,15 @@ run_accuracy() {
         log "lm_eval not found — installing ${ACCURACY_PIP_SPEC:-lm_eval[api]}"
         python3 -m pip install --no-cache-dir "${ACCURACY_PIP_SPEC:-lm_eval[api]}"
     fi
-    local base_url="http://127.0.0.1:${GATEWAY_PORT:-${PROXY_PORT}}/v1/completions"
+    # ACCURACY_CHAT=1 scores through the chat template, with the few-shot examples
+    # as prior turns, for models that answer only in that form; the reasoning they
+    # may emit first needs a larger generation budget.
+    local api="completions" lm_model="local-completions" chat=()
+    if [[ "${ACCURACY_CHAT:-0}" == 1 ]]; then
+        api="chat/completions" lm_model="local-chat-completions"
+        chat=(--apply_chat_template --fewshot_as_multiturn --gen_kwargs max_gen_toks=8192)
+    fi
+    local base_url="http://127.0.0.1:${GATEWAY_PORT:-${PROXY_PORT}}/v1/${api}"
     local ts; ts="$(date +%Y%m%d_%H%M%S)"
     local logf="${LOG_PATH}/accuracy_${MODEL_NAME}_${PARALLEL_MODE}_${ts}.log"
     local outdir="${LOG_PATH}/lm_eval_${MODEL_NAME}_${PARALLEL_MODE}_${ts}"
@@ -293,10 +301,10 @@ run_accuracy() {
       # Model weights are already served (loaded offline in a separate process);
       # allow the Hub only here so lm_eval can fetch the eval dataset (e.g. gsm8k).
       export HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0
-      python3 -m lm_eval --model local-completions \
+      python3 -m lm_eval --model "${lm_model}" \
         --tasks "${ACCURACY_TASKS}" \
         --model_args "model=${MODEL_PATH},base_url=${base_url},num_concurrent=${ACCURACY_NUM_CONCURRENT},max_retries=${ACCURACY_MAX_RETRIES},tokenized_requests=False,trust_remote_code=True,timeout=${ACCURACY_TIMEOUT:-3600}" \
-        --output_path "${outdir}" "${samples[@]}" \
+        "${chat[@]}" --output_path "${outdir}" "${samples[@]}" \
         2>&1 | tee "${logf}"
     ) || eval_rc=$?
     if (( eval_rc != 0 )); then
@@ -379,8 +387,9 @@ exports = {
     "MODEL_EXPERIMENTAL_FLAGS": cfg.get("experimental_flags", "") or "",
 }
 for k, v in exports.items(): print(f"{k}={q(v)}")
-# Model-specific env: exported only if not already set (caller env wins).
-for k, v in (cfg.get("env", {}) or {}).items():
+# Model-specific env, then the mode's: exported only if not already set (caller env wins).
+env = {**(cfg.get("env", {}) or {}), **(cfg.get(f"{mode}_env", {}) or {})}
+for k, v in env.items():
     if k not in os.environ:
         print(f"export {k}={q(v)}")
 PY

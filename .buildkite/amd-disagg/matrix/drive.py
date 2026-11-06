@@ -18,8 +18,9 @@ least recently go first.
 
 Every POLL_S seconds, one session on the login node checks the jobs in flight
 and counts the nodes of all the user's Spur jobs, running or pending. A cell
-starts only if that count plus its own nodes stays within MX_MAX_NODES, and no
-cell starts after MX_NO_NEW_AFTER. Every cell runs the same vLLM and vllm-router
+starts only if that count plus its own nodes stays within MX_MAX_NODES; a cell
+that needs more nodes than that starts only while the count is zero. No cell
+starts after MX_NO_NEW_AFTER. Every cell runs the same vLLM and vllm-router
 images: the nightly tags, resolved to digests when the run starts.
 
 A failed cell is retried once on its own (out-of-memory with a smaller KV cap),
@@ -118,19 +119,37 @@ MODELS = {  # key: (MODEL_NAME, MODEL_DIR)
     "minimax": ("MiniMax-M3-MXFP8", "/shared_nfs/models/MiniMaxAI"),
     "kimi": ("Kimi-K2.6-MXFP4", "/shared_nfs/models/amd"),
     "glm": ("GLM-5.2-FP8", "/shared_nfs/models/zai-org"),
+    "kimik3": ("Kimi-K3", "/shared_nfs/models/moonshotai"),
+    "minimax31": ("MiniMax-M3.1-Flash-Quark-MXFP4", "/shared_nfs/models/amd"),
+}
+# Extra submit.sh environment for a model's cells, then for one cell (which wins);
+# an empty value drops the variable.
+SUBMIT_ENV = {
+    # 190 GiB of weights per GPU in TP8 leave room for a 24 GiB KV cache, and a node
+    # without the checkpoint in its page cache reads 1.5 TB from NFS for ~90 min.
+    "kimik3": {"KV_GIB": "24", "HEALTH_TIMEOUT_S": "9000", "SLURM_TIME_LIMIT": "04:00:00"},
+    # A 16 GiB KV cache holds ~180 KDA states per TP1 rank, and vLLM's warmup batch
+    # of max_num_seqs must fit in them.
+    "kimik3_2p2d-ep": {"KV_GIB": "", "CLUSTER_SERVE_FLAGS": "--kv-cache-memory-bytes 17179869184 "
+                       "--max-num-batched-tokens 1024 --max-num-seqs 128"},
+    # Mono decode serves steps of at most 16 tokens.
+    "minimax31": {"ACCURACY_NUM_CONCURRENT": "16"},
 }
 # Nodes per layout, as submit.sh lays them out.
-LAYOUTS = {"1p1d-tp8": 2, "2p1d-tp8": 3, "1p1d-ep": 2, "2p1d-ep": 3, "1p2d-ep": 3}
+LAYOUTS = {"1p1d-tp8": 2, "2p1d-tp8": 3, "1p1d-tp4": 2, "2p1d-tp4": 3,
+           "1p1d-ep": 2, "2p1d-ep": 3, "1p2d-ep": 3, "2p2d-ep": 4}
 PILOT = "minimax_2p1d-ep"
 TP_ORDER = [
-    "dsv4_1p1d-tp8", "minimax_1p1d-tp8", "kimi_1p1d-tp8", "glm_1p1d-tp8",
-    "dsv4_2p1d-tp8", "minimax_2p1d-tp8", "kimi_2p1d-tp8", "glm_2p1d-tp8",
+    "dsv4_1p1d-tp8", "minimax_1p1d-tp8", "kimi_1p1d-tp8", "glm_1p1d-tp8", "kimik3_1p1d-tp8", "minimax31_1p1d-tp4",
+    "dsv4_2p1d-tp8", "minimax_2p1d-tp8", "kimi_2p1d-tp8", "glm_2p1d-tp8", "minimax31_2p1d-tp4",
 ]
 EP_ORDER = [
     PILOT, "minimax_1p1d-ep", "minimax_1p2d-ep",
     "kimi_1p1d-ep", "kimi_2p1d-ep", "kimi_1p2d-ep",
     "glm_1p1d-ep", "glm_2p1d-ep", "glm_1p2d-ep",
     "dsv4_1p1d-ep", "dsv4_2p1d-ep", "dsv4_1p2d-ep",
+    "minimax31_1p1d-ep", "minimax31_2p1d-ep", "minimax31_1p2d-ep",
+    "kimik3_2p2d-ep",
 ]
 ACC_ORDER = TP_ORDER + EP_ORDER
 BENCH_ORDER = [f"{c}_bench" for c in ACC_ORDER]
@@ -501,6 +520,12 @@ def acc_failed(st, rid):
     return r is not None and r["status"] == "done" and not acc_passed(st, rid)
 
 
+def room_for(st, rid, free):
+    """Whether cell rid can start with `free` nodes of the budget unused. A cell that
+    needs more than MAX_NODES starts only while the user's Spur jobs hold none."""
+    return LAYOUTS[st["runs"][rid]["layout"]] <= free or free == MAX_NODES
+
+
 def pick(st, free):
     """The next queued cell that fits in `free` nodes, or None."""
     return None if st["paused"] else next_cell(st, free)
@@ -520,7 +545,7 @@ def next_cell(st, free):
     order = st.get("bench_order") or []
     for rid in order + [c for c in BENCH_ORDER if c not in order]:
         r = runs.get(rid)
-        if r and r["status"] == "queued" and acc_passed(st, rid) and LAYOUTS[r["layout"]] <= free:
+        if r and r["status"] == "queued" and acc_passed(st, rid) and room_for(st, rid, free):
             return rid
     return None
 
@@ -532,7 +557,7 @@ def acc_pick(st, free):
     ep_inflight = any(runs[i]["kind"] == "ep" and runs[i]["workload"] == "accuracy" for i in fl)
 
     def fits(ids):
-        return [i for i in ids if i in runs and runs[i]["status"] == "queued" and LAYOUTS[runs[i]["layout"]] <= free]
+        return [i for i in ids if i in runs and runs[i]["status"] == "queued" and room_for(st, i, free)]
     tp_q = fits(TP_ORDER)
     if st["ep_gate"] == "pilot":
         ep_q = fits([PILOT]) if not ep_inflight else []
@@ -559,8 +584,10 @@ def start_cells(st, held):
         rid = pick(st, free)
         if not rid:
             nxt = None if inflight(st) else pick(st, MAX_NODES)
-            note = nxt and (f"WAIT {nxt}: your Spur jobs hold {held} node(s); it needs "
-                            f"{LAYOUTS[st['runs'][nxt]['layout']]} of the {MAX_NODES}-node budget")
+            need = LAYOUTS[st["runs"][nxt]["layout"]] if nxt else 0
+            note = nxt and (f"WAIT {nxt}: your Spur jobs hold {held} node(s); it needs " + (
+                f"{need} of the {MAX_NODES}-node budget" if need <= MAX_NODES
+                else f"{need} nodes, more than the {MAX_NODES}-node budget, so it starts only once they hold none"))
             if note and note != wait_note:
                 say(note)
             wait_note = note
@@ -594,6 +621,9 @@ def submit(st, rid):
                     "BENCHMARK_MIN_PROMPTS": str(BENCH_MIN_PROMPTS), "SLURM_TIME_LIMIT": b["time_limit"]})
         if b.get("defer_timeout"):
             env["MORIIO_DEFER_TIMEOUT"] = b["defer_timeout"]
+    for key in (r["model"], acc_id(rid)):
+        env.update(SUBMIT_ENV.get(key, {}))
+    env = {k: v for k, v in env.items() if v}
     if a["kv"]:
         env["KV_GIB"] = str(a["kv"])
     if a["mtu"]:
@@ -764,6 +794,12 @@ def cell_name(r):
     return f"{MODELS[r['model']][0]} {r['layout'].upper().replace('-', ' ')}"
 
 
+def cell_gpus(r):
+    """GPUs the cell's servers run on: a -tpN layout's take N of each node's GPUs."""
+    tp = re.search(r"-tp(\d+)$", r["layout"])
+    return LAYOUTS[r["layout"]] * (int(tp.group(1)) if tp else GPUS_PER_NODE)
+
+
 def num(v, digits, div=1):
     """v / div with `digits` decimals; "-" if v isn't a number."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
@@ -823,12 +859,12 @@ def bench_tables(st, done, results):
            "| Cell | GPUs | " + " | ".join(label(lv) for lv in levels) + " |",
            "|---|---|" + "---|" * len(levels)]
     for rid, r, a in done:
-        gpus = LAYOUTS[r["layout"]] * GPUS_PER_NODE
+        gpus = cell_gpus(r)
         row = [per_gpu(results[rid][lv], gpus) if lv in results[rid] else "-" for lv in levels]
         out.append(f"| {cell_name(r)} | {gpus} | " + " | ".join(row) + " |")
     out.append("")
     for rid, r, a in done:
-        gpus = LAYOUTS[r["layout"]] * GPUS_PER_NODE
+        gpus = cell_gpus(r)
         out += [f"### {cell_name(r)}: job {a['job']} on {gpus} GPUs", "",
                 f"| {'Lengths @ concurrency' if multi else 'Concurrency'} | Requests | Output tok/s | "
                 "Output tok/s/GPU | Total tok/s | TTFT ms, median / P99 | TPOT ms, median / P99 | "
@@ -862,7 +898,7 @@ def write_bench_tsv(done, results):
     run = os.path.basename(os.path.abspath(STATE_DIR))
     rows = ["\t".join(BENCH_TSV_COLS)]
     for rid, r, a in done:
-        gpus = LAYOUTS[r["layout"]] * GPUS_PER_NODE
+        gpus = cell_gpus(r)
         for (isl, osl, con), x in sorted(results[rid].items()):
             tput = x.get("output_throughput")
             own = {"run": run, "id": rid, "model": MODELS[r["model"]][0], "layout": r["layout"], "gpus": gpus,
@@ -896,11 +932,17 @@ def write_summary(st, final=False):
         out.append(f"- EP gate blocked: the pilot `{PILOT}` failed twice, so EP cells that hadn't started didn't run.")
     if (c["accuracy"]["queued"] or c["bench"]["queued"]) and past_cutoff(st):
         out.append(f"- No cell starts after {cutoff_text(st)}, so the cells that hadn't started by then didn't run.")
+    big = {}
+    for rid, r in st["runs"].items():
+        if LAYOUTS[r["layout"]] > MAX_NODES:
+            big.setdefault(acc_id(rid), r)
     out += [
         f"- Code: `{st.get('commit', '-')}`, staged to `{st.get('remote_root', REMOTE_ROOT)}` on Crusoe.",
         f"- vLLM image: `{st['images']['vllm']}` (vLLM `{vllm}`).",
         f"- Router image: `{st['images']['router']}`.",
         f"- At most {MAX_NODES} nodes at a time across all of {SPUR_USER}'s Spur jobs"
+        + "".join(f"; {cell_name(r)} needs {LAYOUTS[r['layout']]}, so its cells start only while those jobs hold none"
+                  for r in big.values())
         + (f"; no new cell after {cutoff_text(st)}." if st.get("cutoff") else "."),
         f"- Expected failures: {', '.join(sorted(XFAIL)) or 'none'}.",
     ]

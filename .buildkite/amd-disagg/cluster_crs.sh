@@ -214,7 +214,8 @@ export NUM_PROMPTS_FACTOR="${NUM_PROMPTS_FACTOR:-2}"
 export BENCHMARK_MIN_PROMPTS="${BENCHMARK_MIN_PROMPTS:-32}"
 
 # ----------------------------------------------------------------- accuracy
-# `accuracy` role runs lm_eval (local-completions backend) against the proxy.
+# `accuracy` role runs lm_eval (local-completions backend, local-chat-completions
+# with ACCURACY_CHAT=1) against the proxy.
 export ACCURACY_TASKS="${ACCURACY_TASKS:-gsm8k}"
 export ACCURACY_NUM_CONCURRENT="${ACCURACY_NUM_CONCURRENT:-64}"
 export ACCURACY_MAX_RETRIES="${ACCURACY_MAX_RETRIES:-3}"
