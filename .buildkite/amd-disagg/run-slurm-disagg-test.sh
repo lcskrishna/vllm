@@ -43,6 +43,8 @@ SLURM_LOG_DIR="${SLURM_LOG_DIR:-}"
 # Optional sbatch --nodelist, e.g. host-[081,082]. MoRI-IO fails between nodes whose
 # RoCE MTUs differ, so pin a matched pair on clusters with mixed MTUs.
 NODELIST="${NODELIST:-}"
+# Optional sbatch --exclude, e.g. host-108,host-110: nodes known to be broken.
+EXCLUDE_NODES="${EXCLUDE_NODES:-}"
 TIME_LIMIT="${SLURM_TIME_LIMIT:-03:00:00}"
 WIDE_EP_MODE="${WIDE_EP_MODE:-0}"              # 0 -> 1P1D TP8 (default); 1 -> wide-EP
 xP="${xP:-1}"
@@ -94,6 +96,7 @@ SBATCH_ARGS=(--time="${TIME_LIMIT}")
 [[ -n "${PARTITION}" ]] && SBATCH_ARGS+=(--partition="${PARTITION}")
 [[ -n "${QOS}" ]] && SBATCH_ARGS+=(--qos="${QOS}")
 [[ -n "${NODELIST}" ]] && SBATCH_ARGS+=(--nodelist="${NODELIST}")
+[[ -n "${EXCLUDE_NODES}" ]] && SBATCH_ARGS+=(--exclude="${EXCLUDE_NODES}")
 # The job script's own --output/--error point at node-local /tmp, which is gone
 # with the allocation; set this to keep the scheduler's stdout/stderr on shared FS.
 if [[ -n "${SLURM_LOG_DIR}" ]]; then
@@ -126,7 +129,7 @@ if [[ -n "${SBATCH_RESERVATION:-}" ]]; then
     fi
 fi
 
-echo "[slurm-submit] image=${IMAGE} nodes=${NODES} gpus/node=${GPUS_PER_NODE} mode=$([[ ${WIDE_EP_MODE} == 0 ]] && echo tp || echo ep) router=${ROUTER_TYPE} walltime=${TIME_LIMIT} account=${ACCOUNT:-<default>} partition=${PARTITION:-<default>} qos=${QOS:-<default>} nodelist=${NODELIST:-<any>}"
+echo "[slurm-submit] image=${IMAGE} nodes=${NODES} gpus/node=${GPUS_PER_NODE} mode=$([[ ${WIDE_EP_MODE} == 0 ]] && echo tp || echo ep) router=${ROUTER_TYPE} walltime=${TIME_LIMIT} account=${ACCOUNT:-<default>} partition=${PARTITION:-<default>} qos=${QOS:-<default>} nodelist=${NODELIST:-<any>} exclude=${EXCLUDE_NODES:-<none>}"
 SUBMIT_OUT="$(sbatch "${SBATCH_ARGS[@]}" "${SUBMIT_SCRIPT}")"
 echo "${SUBMIT_OUT}"
 # "Submitted batch job 114" -> 114 (last integer on the line).

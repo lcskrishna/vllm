@@ -126,6 +126,15 @@ step()
 print("after preflight:", inflight(), st["runs"][tp]["preflight_resubmits"])
 assert tp in inflight() and st["runs"][tp]["preflight_resubmits"] == 1
 
+# A rejection that names its node keeps that node out of every later job.
+finish(tp, "1", "-", "preflight", "[1] PREFLIGHT-REJECTED: rank 1 on n108: docker cannot start containers")
+since = len(submits)
+step()
+assert st["exclude"] == {"n108": "docker cannot start containers"}, st["exclude"]
+assert tp in inflight() and st["runs"][tp]["preflight_resubmits"] == 2
+d.write_summary(st)
+assert "- Nodes kept out of this run: n108 (docker cannot start containers)." in open(d.SUMMARY).read()
+
 # Control: requeue the failed EP run and unblock.
 with open(d.CONTROL, "w") as f:
     f.write("requeue minimax_1p1d-ep kv=16\nunblock-ep\n")
@@ -142,6 +151,7 @@ for _ in range(200):
 order = [s[0] for s in submits]
 print("submit order:", order)
 assert all(r["status"] == "done" for r in st["runs"].values())
+assert all("EXCLUDE_NODES=n108" in s[2] for s in submits[since:]) and len(submits) > since + 1
 # A cell that needs fewer nodes may start ahead of one that doesn't fit yet, so
 # EP order holds among cells of the same size.
 ep_first = [o for i, o in enumerate(order) if o.endswith("-ep") and o not in order[:i]]

@@ -25,8 +25,9 @@ images: the nightly tags, resolved to digests when the run starts.
 
 A failed cell is retried once on its own (out-of-memory with a smaller KV cap),
 except the expected failures in MX_XFAIL and benchmarks that got through at
-least one level. A preflight rejection (dirty node) is resubmitted without
-counting as a retry. A job whose gsm8k or benchmark makes no progress for
+least one level. A preflight rejection (a busy node, or one whose docker cannot
+start containers) is resubmitted without counting as a retry, and that node gets
+no more of the run's jobs. A job whose gsm8k or benchmark makes no progress for
 STALL_S is cancelled and fails as class "stall". With --ep-gate the EP pilot
 runs first among the EP cells and the others start only once it passes; a
 pilot that fails twice blocks them. SIGTERM, SIGINT or SIGHUP cancels the jobs
@@ -44,6 +45,7 @@ Environment:
   MX_MAX_NODES     node budget across all the user's Spur jobs (default: 3)
   MX_NO_NEW_AFTER  HH:MM IST after which no cell starts (default: 23:00; empty: none)
   MX_XFAIL         expected-fail cells, comma-separated (default: glm_2p1d-ep)
+  MX_EXCLUDE       nodes no job may get, comma-separated (default: none)
   MX_BENCH_ISL_OSL     benchmark input/output lengths, space-separated (default: 8192/1024)
   MX_BENCH_CON         benchmark concurrency levels (default: 8 16 32 64)
   MX_BENCH_PROMPTS     prompts per level, times its concurrency, at least 32 (default: 2)
@@ -97,6 +99,7 @@ POLL_S = int(os.environ.get("POLL_S", "120"))
 MAX_NODES = int(os.environ.get("MX_MAX_NODES", "3"))
 NO_NEW_AFTER = os.environ.get("MX_NO_NEW_AFTER", "23:00")
 XFAIL = {c for c in os.environ.get("MX_XFAIL", "glm_2p1d-ep").split(",") if c}
+EXCLUDE = [h for h in os.environ.get("MX_EXCLUDE", "").split(",") if h]
 BENCH = {"isl_osl": os.environ.get("MX_BENCH_ISL_OSL", "8192/1024"),
          "con": os.environ.get("MX_BENCH_CON", "8 16 32 64"),
          "prompts": os.environ.get("MX_BENCH_PROMPTS", "2"),
@@ -196,7 +199,7 @@ def new_state(cells=None):
                      "workload": "accuracy" if rid in ACC_ORDER else "bench",
                      "status": "queued", "next": {}, "attempts": [], "preflight_resubmits": 0}
     return {"runs": runs, "ep_gate": "pilot" if EP_GATE and PILOT in runs else "open", "paused": False,
-            "images": dict(IMAGES), "bench": dict(BENCH)}
+            "images": dict(IMAGES), "bench": dict(BENCH), "exclude": {}}
 
 
 def load(cells=None):
@@ -355,10 +358,19 @@ def inflight(st):
     return [rid for rid, r in st["runs"].items() if r["status"] in ("submitting", "inflight")]
 
 
+def exclude_node(st, host, why):
+    if host not in st["exclude"]:
+        st["exclude"][host] = why
+        say(f"EXCLUDE {host}: {why}; it gets no more of this run's jobs")
+
+
 def classify_finish(st, rid, a):
     """Decide what happens after attempt `a` of run `rid` ended."""
     r = st["runs"][rid]
     cls = a.get("class", "unknown")
+    m = re.search(r"PREFLIGHT-REJECTED: rank \d+ on ([^\s:]+): (.+)", a.get("note") or "")
+    if cls == "preflight" and m:
+        exclude_node(st, m.group(1), m.group(2).strip())
     if "requeue_after" in r:
         r["status"], r["next"] = "queued", r.pop("requeue_after")
         if rid == PILOT and EP_GATE:
@@ -624,6 +636,8 @@ def submit(st, rid):
     for key in (r["model"], acc_id(rid)):
         env.update(SUBMIT_ENV.get(key, {}))
     env = {k: v for k, v in env.items() if v}
+    if st["exclude"]:
+        env["EXCLUDE_NODES"] = ",".join(sorted(st["exclude"]))
     if a["kv"]:
         env["KV_GIB"] = str(a["kv"])
     if a["mtu"]:
@@ -946,6 +960,9 @@ def write_summary(st, final=False):
         + (f"; no new cell after {cutoff_text(st)}." if st.get("cutoff") else "."),
         f"- Expected failures: {', '.join(sorted(XFAIL)) or 'none'}.",
     ]
+    if st["exclude"]:
+        out.append("- Nodes kept out of this run: "
+                   + "; ".join(f"{h} ({why})" for h, why in sorted(st["exclude"].items())) + ".")
     if c["bench"]["cells"]:
         b = st["bench"]
         defer = (f"; MoRIIO lets a prefill wait {b['defer_timeout']} s for decode KV blocks" if b.get("defer_timeout")
@@ -1071,6 +1088,8 @@ def main(argv=None):
                           "router": args.router_image or resolve(IMAGES["router"])})
     elif args.image or args.router_image:
         say("DRIVER WARN: resuming a run, which keeps its images; --image and --router-image are ignored")
+    for h in EXCLUDE:
+        exclude_node(st, h, "set in MX_EXCLUDE")
     st.pop("stopped", None)
     save(st)
     write_summary(st)
