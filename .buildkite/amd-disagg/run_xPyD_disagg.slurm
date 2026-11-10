@@ -355,32 +355,45 @@ preflight_node() {
     fi
 
     if [ -n "$problems" ]; then
-        mkdir -p "$LOG_PATH" 2>/dev/null || true
         local summary
         summary="$(printf '%s; ' "${issues[@]}")"
-        summary="${summary%; }"
-        # Every node writes the shared job log concurrently, so this diagnostic can
-        # be overwritten there. Keep a single-writer copy per node as well, or the
-        # job fails in seconds with no surviving explanation. The submitter reads
-        # the PREFLIGHT-REJECTED line back out of it to use as the failure reason,
-        # so keep that prefix in sync with run-slurm-disagg-test.sh. It must not
-        # contain "FAIL:" — that is the accuracy gate's pattern.
         {
-            echo "PREFLIGHT-REJECTED: rank ${rank} on ${host}: ${summary}"
             printf '%s' "$problems"
             echo "  containers here: $(docker ps --format '{{.Names}} ({{.Image}})' 2>/dev/null | paste -sd'; ' - || true)"
             echo "  --exclusive does not exclude non-SLURM workloads; clear the node or exclude it from the allocation."
-            echo "  Set PREFLIGHT=0 to submit anyway."
-        } | tee -a "$LOG_PATH/preflight_NODE${rank}.log" 2>/dev/null || true
-        # Unblock the other ranks: they park on this sentinel, and the submitter
-        # polls it. Without it a peer waits out HEALTH_TIMEOUT_S for an endpoint
-        # that is never coming.
-        echo 1 > "$LOG_PATH/.disagg_done" 2>/dev/null || true
+        } | reject_node "$rank" "${summary%; }"
         return 1
     fi
 
     echo "Rank $rank preflight ok on $host: GPUs idle, ports free (${want[*]})"
     return 0
+}
+
+# Turn this node away. $1 = rank, $2 = one-line reason; detail lines on stdin.
+reject_node() {
+    local rank="$1" reason="$2"
+    mkdir -p "$LOG_PATH" 2>/dev/null || true
+    # Every node writes the shared job log concurrently, so this diagnostic can
+    # be overwritten there. Keep a single-writer copy per node as well, or the
+    # job fails in seconds with no surviving explanation. The submitter reads
+    # the PREFLIGHT-REJECTED line back out of it to use as the failure reason,
+    # so keep that prefix in sync with run-slurm-disagg-test.sh. It must not
+    # contain "FAIL:" — that is the accuracy gate's pattern.
+    {
+        echo "PREFLIGHT-REJECTED: rank ${rank} on $(hostname): ${reason}"
+        cat
+        echo "  Set PREFLIGHT=0 to submit anyway."
+    } | tee -a "$LOG_PATH/preflight_NODE${rank}.log" 2>/dev/null || true
+    release_peers
+}
+
+# A rank that cannot serve releases the others: they park on the completion
+# sentinel, rank 0's health gate gives up once it appears, and the submitter
+# polls it. Without it a peer waits out HEALTH_TIMEOUT_S for an endpoint that
+# is never coming.
+release_peers() {
+    mkdir -p "$LOG_PATH" 2>/dev/null || true
+    echo 1 > "$LOG_PATH/.disagg_done" 2>/dev/null || true
 }
 
 # Per-node container launch, auto-dispatched by srun availability:
@@ -436,6 +449,17 @@ run_node_container() {
             echo "Rank $rank pulling router image on $(hostname): $VLLM_ROUTER_IMAGE"
             docker pull "$VLLM_ROUTER_IMAGE" || echo "WARN: docker pull failed on $(hostname) for $VLLM_ROUTER_IMAGE (using local copy if present)"
         fi
+        # A docker daemon that has lost containerd still gets scheduled, then
+        # fails every pull and run on the node. A failed pull alone may be the
+        # registry's fault, so only the daemon's own error turns the node away.
+        local probe daemon_err='containerd\.sock|Cannot connect to the Docker daemon'
+        if [ "${PREFLIGHT:-1}" = "1" ] \
+           && ! probe="$(docker run --rm --pull never --network none --entrypoint true "$IMAGE" 2>&1)" \
+           && grep -qE "$daemon_err" <<< "$probe"; then
+            echo "  $(grep -m1 -E "$daemon_err" <<< "$probe")" \
+                | reject_node "$rank" "docker cannot start containers"
+            return 1
+        fi
     fi
 
     # Replace the image's ionic RoCE userspace with another repo.radeon.com
@@ -476,7 +500,7 @@ run_node_container() {
             # the script.
             docker stop -t 30 "$build_cont" >/dev/null 2>&1 || true
             docker rm "$build_cont" >/dev/null 2>&1 || true
-            [ "$swap_rc" = "0" ] || return 1
+            [ "$swap_rc" = "0" ] || { release_peers; return 1; }
         fi
         RUN_IMAGE="$ainic_tag"
     fi
@@ -491,6 +515,7 @@ run_node_container() {
         for vp in $VLLM_PATCHES; do
             if [ ! -f "$DISAGG_SCRIPTS_DIR/$vp" ]; then
                 echo "ERROR: rank $rank: VLLM_PATCHES entry not found: $DISAGG_SCRIPTS_DIR/$vp" >&2
+                release_peers
                 return 1
             fi
             vp_files+=("$DISAGG_SCRIPTS_DIR/$vp")
@@ -526,7 +551,7 @@ run_node_container() {
                 fi
                 docker stop -t 30 "$vp_cont" >/dev/null 2>&1 || true
                 docker rm "$vp_cont" >/dev/null 2>&1 || true
-                [ "$vp_rc" = "0" ] || return 1
+                [ "$vp_rc" = "0" ] || { release_peers; return 1; }
             fi
             RUN_IMAGE="$vp_tag"
         fi
@@ -658,7 +683,7 @@ if command -v srun >/dev/null 2>&1; then
     srun --label \
          --nodelist="$SELECTED_NODELIST_STR" \
          --nodes="$NUM_NODES" --ntasks="$NUM_NODES" --ntasks-per-node=1 \
-      bash -c "$(declare -f preflight_node run_node_container); run_node_container \"\$SLURM_PROCID\"" || RC=$?
+      bash -c "$(declare -f preflight_node reject_node release_peers run_node_container); run_node_container \"\$SLURM_PROCID\"" || RC=$?
 else
     # Spur: the body already runs once per node; this node's rank is
     # SPUR_TASK_OFFSET (fall back to NODE_RANK, then 0 for a single-node run).

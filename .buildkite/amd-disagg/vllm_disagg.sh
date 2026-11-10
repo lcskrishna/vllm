@@ -565,6 +565,7 @@ wait_all_healthy() {
         until /usr/bin/curl -sf "http://${ep}/health" >/dev/null 2>&1; do
             (( $(date +%s) >= deadline )) && { log "TIMEOUT waiting for ${ep}"; return 1; }
             kill -0 "${SERVER_PID}" 2>/dev/null || { log "local server (pid ${SERVER_PID}) exited while waiting"; return 1; }
+            [[ -f "${LOG_PATH}/.disagg_done" ]] && { log "another rank gave up before serving (${LOG_PATH}/.disagg_done)"; return 1; }
             sleep 10
         done
         log "healthy: ${ep}"

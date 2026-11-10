@@ -226,6 +226,17 @@ saved = json.load(open(d.STATE))
 assert [a["verdict"] for a in saved["runs"]["kimi_1p1d-tp8"]["attempts"]] == ["CANCELLED", "FAIL", "PASS"]
 assert "stopped" not in saved and "1 of 1 cells passed" in open(d.SUMMARY).read()
 
+# MX_EXCLUDE keeps its nodes out of every job of the run, and summary.md says so.
+for f in (d.STATE, d.LOCK):
+    os.remove(f)
+fresh()
+d.EXCLUDE = ["crs-108"]
+d.time.sleep = stop
+d.main(["--cells", "kimi_1p1d-tp8", "--image", "i", "--router-image", "r"])
+d.EXCLUDE = []
+assert "EXCLUDE_NODES=crs-108" in submits[0][2], submits
+assert "- Nodes kept out of this run: crs-108 (set in MX_EXCLUDE)." in open(d.SUMMARY).read()
+
 # A stop while a submit is unconfirmed also cancels the job jobs.log has for that cell;
 # if that ssh fails too, summary.md says the job may still be running.
 for f in (d.STATE, d.LOCK):
