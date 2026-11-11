@@ -194,6 +194,7 @@ bench_serve() {
         --base-url "${base_url}" \
         --endpoint /v1/completions \
         --model "${MODEL_PATH}" \
+        --trust-remote-code \
         --dataset-name random \
         --random-input-len "${isl}" \
         --random-output-len "${osl}" \
@@ -555,7 +556,8 @@ health_endpoints() {
     fi
 }
 
-# Block until every endpoint's /health is OK, or timeout, or our local server dies.
+# Block until every endpoint's /health is OK, or timeout, or our local server
+# dies, or another rank reports that its server died.
 wait_all_healthy() {
     local deadline=$(( $(date +%s) + HEALTH_TIMEOUT_S ))
     local eps; mapfile -t eps < <(health_endpoints)
@@ -566,6 +568,7 @@ wait_all_healthy() {
             (( $(date +%s) >= deadline )) && { log "TIMEOUT waiting for ${ep}"; return 1; }
             kill -0 "${SERVER_PID}" 2>/dev/null || { log "local server (pid ${SERVER_PID}) exited while waiting"; return 1; }
             [[ -f "${LOG_PATH}/.disagg_done" ]] && { log "another rank gave up before serving (${LOG_PATH}/.disagg_done)"; return 1; }
+            [[ -f "${LOG_PATH}/.disagg_server_exited" ]] && { log "rank $(cat "${LOG_PATH}/.disagg_server_exited" 2>/dev/null) server exited while waiting"; return 1; }
             sleep 10
         done
         log "healthy: ${ep}"
@@ -637,7 +640,12 @@ watch_until_done() {
     while :; do
         [[ -f "${sentinel}" ]] && { log "completion sentinel seen; shutting down"; break; }
         if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-            log "local server (pid ${SERVER_PID}) exited before completion"; rc=1; break
+            log "local server (pid ${SERVER_PID}) exited before completion"; rc=1
+            # Lets rank 0's health gate give up instead of waiting out
+            # HEALTH_TIMEOUT_S. Not the sentinel: that holds rank 0's verdict, and
+            # the driver stops checking a job for stalls once it exists.
+            echo "${NODE_RANK}" > "${LOG_PATH}/.disagg_server_exited" 2>/dev/null || true
+            break
         fi
         sleep 10
     done
