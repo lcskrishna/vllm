@@ -1,9 +1,11 @@
 """Benchmark cells: they wait for the accuracy cells and run only where accuracy
 passed; their submit settings, retries, order and summary tables; status.sh on
-benchmark jobs; and the launcher's benchmark gate."""
+benchmark jobs; and the launcher's benchmark gate. Also the launcher's MoRIIO KV
+config, and how it ends a job whose server dies during bring-up."""
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -187,14 +189,22 @@ assert got["503"]["gate"] == "PASS: exact_match=0.951234" and got["503"]["levels
 
 # The launcher's benchmark role, with a stand-in for vllm: an unrecorded warmup,
 # a seed per level, a result JSON per level, and a gate line; it stops at the
-# first failed level.
+# first failed level. Like Kimi-K3's tokenizer, the stand-in won't load without
+# --trust-remote-code. As a server it stays up, or crashes with FAKE_SERVE=crash.
 work = tempfile.mkdtemp()
 fake = os.path.join(work, "bin")
 os.makedirs(fake)
 with open(os.path.join(fake, "vllm"), "w") as f:
     f.write("""#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 a = sys.argv[1:]
+if a[0] == "serve":
+    if os.environ.get("FAKE_SERVE") == "crash":
+        sys.exit("RuntimeError: fake server crashed while loading")
+    time.sleep(120)
+    sys.exit(0)
+if "--trust-remote-code" not in a:
+    sys.exit("ValueError: the tokenizer has custom code; pass trust_remote_code=True")
 def arg(k):
     return a[a.index(k) + 1]
 n, con = int(arg("--num-prompts")), arg("--max-concurrency")
@@ -263,5 +273,50 @@ for ep in ("0", "1"):
     assert extra is not None and "defer_timeout" not in extra, (ep, extra)
 p, _ = kv_config(MORIIO_DEFER_TIMEOUT="abc")
 assert p.returncode == 1 and "MORIIO_DEFER_TIMEOUT='abc' is not a number of seconds" in p.stderr, p.stderr
+
+
+# A rank whose server dies during bring-up says so, and rank 0's health gate
+# gives up at once instead of waiting out HEALTH_TIMEOUT_S. The verdict stays
+# rank 0's, and status.sh reads it as a bring-up failure with the server's error.
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return str(s.getsockname()[1])
+
+
+root = os.path.join(work, "logs-up")
+up = os.path.join(root, "601")
+os.makedirs(up)
+node_env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", CLUSTER_ENV=os.path.join(AD, "cluster_crs.sh"),
+                LOG_PATH=up, MODEL_DIR="/shared_nfs/models/MiniMaxAI", MODEL_NAME="MiniMax-M3-MXFP8",
+                IPADDRS="127.0.0.1,127.0.0.1", PREFILL_PORT=free_port(), DECODE_PORT=free_port(),
+                xP="1", yD="1", GPUS_PER_NODE="8", HEALTH_TIMEOUT_S="60")
+
+
+def node(rank, **env):
+    return subprocess.run(["bash", os.path.join(AD, "vllm_disagg.sh"), "node"],
+                          env=dict(node_env, NODE_RANK=str(rank), **env), capture_output=True, text=True, timeout=120)
+
+
+p1 = node(1, FAKE_SERVE="crash")
+assert p1.returncode == 1 and "exited before completion" in p1.stdout, (p1.stdout, p1.stderr)
+assert open(os.path.join(up, ".disagg_server_exited")).read().strip() == "1"
+assert not os.path.exists(os.path.join(up, ".disagg_done"))
+t0 = time.time()
+p0 = node(0)
+assert p0.returncode == 1 and "rank 1 server exited while waiting" in p0.stdout, (p0.stdout, p0.stderr)
+assert time.time() - t0 < 30, time.time() - t0
+assert open(os.path.join(up, ".disagg_done")).read().strip() == "1"
+with open(os.path.join(root, "vllm-disagg-pd-601.log"), "w") as f:
+    f.write("SLURM_JOB_NODELIST: crsuse2-m2m-v3-[084,093]\n" + p0.stdout + p1.stdout)
+with open(os.path.join(fake, "scontrol"), "w") as f:
+    f.write("#!/bin/bash\necho \"JobId=$3 JobState=COMPLETED\"\n")
+os.chmod(os.path.join(fake, "scontrol"), 0o755)
+p = subprocess.run(["bash", os.path.join(MX, "status.sh"), "601"], capture_output=True, text=True,
+                   env=dict(os.environ, LOG_ROOT=root, PATH=f"{fake}:{os.environ['PATH']}"))
+got = dict(kv.split("=", 1) for kv in p.stdout.strip().partition("|")[2].split("|"))
+assert got["rc"] == "1" and got["class"] == "bringup", p.stdout
+assert "rank 1 server exited while waiting" in got["note"], got["note"]
+assert "RuntimeError: fake server crashed while loading" in got["note"], got["note"]
 shutil.rmtree(work)
 print("BENCH OK")
