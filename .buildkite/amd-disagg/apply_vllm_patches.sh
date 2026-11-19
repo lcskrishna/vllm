@@ -3,7 +3,7 @@
 # vllm/ part of a PR the nightly does not have yet. run_xPyD_disagg.slurm runs
 # this as root in a throwaway container and commits the result (VLLM_PATCHES).
 #
-#   ./apply_vllm_patches.sh patches/pr65098-moriio-remote-hosts.diff [...]
+#   ./apply_vllm_patches.sh patches/pr65995-quick-reduce-preload.diff [...]
 #
 # Patches are `git diff` output against the vLLM repo root and may only touch
 # vllm/ (tests/ and .buildkite/ are not installed). A patch that is already

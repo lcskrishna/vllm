@@ -13,7 +13,7 @@ for j in "$@"; do
     gate=$(grep -ahoE '(PASS|FAIL): (exact_match=[0-9.]+|bench=[0-9]+/[0-9]+)' "$log" 2>/dev/null | tail -n1)
     nodes=$(grep -aoE '^SLURM_JOB_NODELIST: [^ ]+' "$log" 2>/dev/null | tail -n1 | cut -d' ' -f2)
     image=$(grep -m1 -aoE 'Digest: sha256:[0-9a-f]{12}' "$log" 2>/dev/null | cut -d: -f3)
-    # VLLM_PATCHES baked into the run image, e.g. "+pr65098-moriio-remote-hosts".
+    # VLLM_PATCHES baked into the run image, e.g. "+pr65995-quick-reduce-preload".
     patches=$(grep -m1 -ahoE 'vllm patches: (building|reusing) .*' "$log" 2>/dev/null | grep -oE '\([^)]*\)$' | tr -d '()\r')
     for p in $patches; do image="${image:--}+$(basename "$p" .diff)"; done
     need=$(grep -aoE 'waiting on [0-9]+' "$log" 2>/dev/null | grep -oE '[0-9]+' | tail -n1)
