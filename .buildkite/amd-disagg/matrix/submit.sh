@@ -5,9 +5,9 @@
 # settings. Each job gets its own staged copy of the scripts.
 # Optional overrides from the caller's env: KV_GIB (KV cache cap in GiB),
 # MORI_IB_PATH_MTU, DRY_RUN=1, ACCURACY_LOG_SAMPLES=0 (matrix runs keep the
-# gsm8k samples by default), VLLM_PATCHES (EP layouts default to the
-# vllm-project/vllm#65098 MoRIIO patch, TP layouts to the #65995 QuickReduce
-# fix; set it empty to serve the plain image), EXCLUDE_NODES (sbatch --exclude),
+# gsm8k samples by default), VLLM_PATCHES (TP layouts default to the
+# vllm-project/vllm#65995 QuickReduce fix; set it empty to serve the plain
+# image), EXCLUDE_NODES (sbatch --exclude),
 # IMAGE / VLLM_ROUTER_IMAGE (default: the launcher's nightly tags),
 # RUN_AFTER_HEALTH=bench with BENCHMARK_COMBINATIONS, BENCHMARK_CON,
 # NUM_PROMPTS_FACTOR, BENCHMARK_MIN_PROMPTS, MORIIO_DEFER_TIMEOUT and
@@ -33,11 +33,7 @@ case "$1" in
   2p2d-ep)  export NODES=4 xP=2 yD=2 WIDE_EP_MODE=1 ;;
   *) echo "unknown layout: $1" >&2; exit 2 ;;
 esac
-# A wide-EP role spans several nodes and vllm-router sends no per-node peer
-# hosts; #65098 lets MoRIIO take them from the serve config instead.
-if [[ "${WIDE_EP_MODE}" == 1 ]]; then
-    export VLLM_PATCHES="${VLLM_PATCHES-patches/pr65098-moriio-remote-hosts.diff}"
-else
+if [[ "${WIDE_EP_MODE}" == 0 ]]; then
     # On AITER with ROCm/aiter#5461, INT4 QuickReduce kills every TP worker at
     # start-up until the image has #65995; from then on the patch is skipped.
     export VLLM_PATCHES="${VLLM_PATCHES-patches/pr65995-quick-reduce-preload.diff}"
