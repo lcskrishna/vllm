@@ -163,6 +163,9 @@ export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-${_IB_GID_INDEX}}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 # In-box RCCL net transport (no external plugin); pin bootstrap to the VPC iface.
 export NCCL_NET_PLUGIN="${NCCL_NET_PLUGIN:-none}"
+# RCCL 2.32 otherwise selects its IB-CAST transport on AINIC, which fails
+# cross-node (DP16+EP16 2P2D). IB needs an RDMA device in the container.
+export NCCL_NET="${NCCL_NET:-IB}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens3}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME}}"
 export NCCL_CROSS_NIC="${NCCL_CROSS_NIC:-0}"
